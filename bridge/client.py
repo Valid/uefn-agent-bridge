@@ -42,8 +42,9 @@ class UEFNBridge:
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
 
-    def _post(self, payload: dict) -> dict:
+    def _post(self, payload: dict, timeout: float = 0) -> dict:
         data = json.dumps(payload).encode()
+        request_timeout = timeout or self.timeout
         req = urllib.request.Request(
             self.base_url,
             data=data,
@@ -51,7 +52,7 @@ class UEFNBridge:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.URLError as exc:
             if "refused" in str(exc).lower() or "no connection" in str(exc).lower():
@@ -62,15 +63,18 @@ class UEFNBridge:
             raise BridgeError(f"HTTP error: {exc}") from exc
         except Exception as exc:
             if "timed out" in str(exc).lower():
-                raise BridgeError(f"Request timed out after {self.timeout}s") from exc
+                raise BridgeError(f"Request timed out after {request_timeout}s") from exc
             raise
 
-    def run(self, command: str, **params: Any) -> Any:
+    def run(self, command: str, *, timeout_s: float = 0, **params: Any) -> Any:
         """Execute a named bridge command with keyword params.
 
         Returns the 'result' dict on success; raises BridgeError on failure.
         """
-        resp = self._post({"command": command, "params": params})
+        payload = {"command": command, "params": params}
+        if timeout_s > 0:
+            payload["timeout_s"] = timeout_s
+        resp = self._post(payload, max(self.timeout, timeout_s + 5) if timeout_s > 0 else 0)
         if not resp.get("ok", False):
             raise BridgeError(
                 resp.get("error", "Unknown error"),
@@ -78,9 +82,9 @@ class UEFNBridge:
             )
         return resp.get("result")
 
-    def exec(self, code: str) -> dict:
+    def exec(self, code: str, timeout_s: float = 0) -> dict:
         """Run arbitrary Python code inside UEFN.  Returns {result, stdout, stderr}."""
-        return self.run("exec", code=code)
+        return self.run("exec", code=code, timeout_s=timeout_s)
 
     def status(self) -> dict:
         """Check bridge health and list available commands."""

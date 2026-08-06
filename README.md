@@ -31,8 +31,8 @@ In UEFN: **Tools → Execute Python Script** → pick `bridge/server.py`
 That's it. You'll see this in the Output Log:
 
 ```
-[Bridge] Bridge v0.1.0 listening on http://127.0.0.1:9210
-[Bridge] 32 commands registered
+[Bridge] Bridge v0.2.0 listening on http://127.0.0.1:9210
+[Bridge] 39 commands registered
 ```
 
 The bridge is now accepting commands.
@@ -126,6 +126,15 @@ const { result } = await res.json();
 | `assets.info` | Details about one asset | `path` |
 | `assets.exists` | Check if an asset path is valid | `path` |
 
+**Verse devices**
+
+| Command | What it does | Key params |
+|---------|-------------|------------|
+| `verse.find_device` | Find placed Verse device actors | `query`, `class_filter` |
+| `verse.export_t3d` | Export one device's complete serialized state | `target`, `filename` |
+| `verse.get_properties` | Read supported generated subobject properties | `path`, `properties` |
+| `verse.set_property` | Write supported generated subobject properties | `path`, `property_name`, `value`, `is_object_ref` |
+
 **Level & Viewport**
 
 | Command | What it does |
@@ -145,6 +154,17 @@ const { result } = await res.json();
 | `undo` / `redo` | Undo or redo the last operation |
 | `reload` | Hot-reload the bridge from disk (no UEFN restart needed) |
 | `fix_throttle` | Disable "Use Less CPU in Background" so commands work when UEFN isn't focused |
+
+## Editing Placed Verse Devices
+
+Find the placed `VerseDevice_C` actor by internal name, then export its complete serialized state for programmatic inspection.
+
+```json
+{"command": "verse.find_device", "params": {"query": "game manager"}}
+{"command": "verse.export_t3d", "params": {"target": "VerseDevice_C_UAID_ABC123"}, "timeout_s": 120}
+```
+
+Plain property access works for numbers, object references, and reference arrays. Verse string, enum, and option values can only be written through the editor's own text import, which the bridge supports with clipboard helpers inside `exec`; the full procedure is in [`RULES.md`](RULES.md). Writes mutate the open level, so an agent must get user approval before editing or saving.
 
 ## Using with AI Agents
 
@@ -183,6 +203,7 @@ tools/
   generate_stubs.py ← create .pyi stubs for IDE autocomplete
 
 examples/           ← working examples for actors, assets, materials, batching
+  verse_devices.py  ← placed Verse device inspection and editing workflow
 
 RULES.md            ← LLM context file — the cheat sheet for AI agents
 ```
@@ -202,6 +223,7 @@ Want autocomplete for `unreal.*` in VS Code or Cursor?
 
 - **UEFN ≠ Unreal Engine.** Lots of standard UE5 Python APIs are stripped or changed. `RULES.md` documents what actually works.
 - **Background throttle.** UEFN slows down when it's not focused. The bridge disables this automatically, but if commands start timing out, run `fix_throttle` or just click the UEFN window.
+- **Long operations.** Any command payload may carry a top-level `"timeout_s"` in seconds, up to 600. The Python client exposes it as `run(..., timeout_s=...)`.
 - **Port conflicts.** If UEFN crashes while the bridge is running, the port might stay bound. Restarting UEFN clears it. The bridge auto-detects this and picks a free port.
 - **Auto-start doesn't work in UEFN.** `init_unreal.py` only works in standard Unreal Engine. In UEFN you run the script manually via **Tools → Execute Python Script** each session.
 - **Hot reload.** Changed `server.py`? Send `{"command": "reload"}` — no need to restart UEFN.

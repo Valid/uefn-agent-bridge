@@ -18,6 +18,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import tempfile
 
 # Store script path at load time — __file__ may not exist when run via UEFN's Execute Python Script
 try:
@@ -62,7 +64,7 @@ REQUEST_TIMEOUT_S = 30.0
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # ── Runtime state ──────────────────────────────────────────────────────────
 
@@ -198,7 +200,8 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
 
     If ``transaction`` is provided, the code runs inside an
     ``unreal.ScopedEditorTransaction`` so the entire operation is a single
-    undo entry in the editor.
+    undo entry in the editor. The namespace includes ``clip_get``, ``clip_set``,
+    ``export_t3d``, ``t3d_parse``, and ``find_actor`` for Verse device edits.
     """
     out, err = io.StringIO(), io.StringIO()
     old_out, old_err = sys.stdout, sys.stderr
@@ -213,6 +216,7 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
             ns[alias] = unreal.get_editor_subsystem(getattr(unreal, cls_name))
         except Exception:
             pass
+    ns.update({"clip_get": _clip_get, "clip_set": _clip_set, "export_t3d": _export_t3d_impl, "t3d_parse": _t3d_parse, "find_actor": _find_actor})
     try:
         sys.stdout, sys.stderr = out, err
         if transaction:
@@ -279,9 +283,9 @@ def _get_actor_sub():
 
 
 def _find_actor(identifier: str) -> unreal.Actor:
-    """Resolve an actor by path OR label."""
+    """Resolve an actor by path, label, or internal name."""
     for a in _get_actor_sub().get_all_level_actors():
-        if a.get_path_name() == identifier or a.get_actor_label() == identifier:
+        if a.get_path_name() == identifier or a.get_actor_label() == identifier or a.get_name() == identifier:
             return a
     raise ValueError(f"Actor not found: {identifier}")
 
@@ -673,6 +677,206 @@ def _cmd_materials_create_instance(
     return {"path": str(mi.get_path_name())}
 
 
+# ── Verse device commands ──────────────────────────────────────────────────
+
+_clip_ready = False
+
+
+def _clip_init() -> None:
+    global _clip_ready, ctypes, u32, k32, CF_UNICODETEXT, GMEM_MOVEABLE
+    if _clip_ready:
+        return
+    import ctypes
+    from ctypes import wintypes
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    u32.OpenClipboard.argtypes = [wintypes.HWND]
+    u32.GetClipboardData.restype = wintypes.HANDLE
+    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u32.SetClipboardData.restype = wintypes.HANDLE
+    k32.GlobalAlloc.restype = wintypes.HGLOBAL
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    _clip_ready = True
+
+
+def _open_clip_retry():
+    _clip_init()
+    for _ in range(40):
+        if u32.OpenClipboard(0):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _clip_get():
+    _clip_init()
+    if not _open_clip_retry():
+        raise RuntimeError("OpenClipboard failed")
+    try:
+        h = u32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = k32.GlobalLock(h)
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            k32.GlobalUnlock(h)
+    finally:
+        u32.CloseClipboard()
+
+
+def _clip_set(text):
+    _clip_init()
+    buf = ctypes.create_unicode_buffer(text)
+    h = k32.GlobalAlloc(GMEM_MOVEABLE, ctypes.sizeof(buf))
+    p = k32.GlobalLock(h)
+    ctypes.memmove(p, buf, ctypes.sizeof(buf))
+    k32.GlobalUnlock(h)
+    if not _open_clip_retry():
+        raise RuntimeError("OpenClipboard failed for set")
+    try:
+        u32.EmptyClipboard()
+        if not u32.SetClipboardData(CF_UNICODETEXT, h):
+            raise RuntimeError("SetClipboardData failed")
+    finally:
+        u32.CloseClipboard()
+
+
+def _export_t3d_impl(actor, filename: str = "") -> str:
+    sub = _get_actor_sub()
+    previous_selection = sub.get_selected_level_actors()
+    path = os.path.abspath(filename or os.path.join(
+        tempfile.gettempdir(), f"uefn_t3d_{actor.get_name()}.t3d"
+    )).replace("\\", "/")
+    try:
+        sub.set_selected_level_actors([actor])
+        task = unreal.AssetExportTask()
+        task.object = unreal.get_editor_subsystem(
+            unreal.UnrealEditorSubsystem
+        ).get_editor_world()
+        task.filename = path
+        task.selected = True
+        task.automated = True
+        task.replace_identical = True
+        task.prompt = False
+        unreal.Exporter.run_asset_export_task(task)
+    finally:
+        sub.set_selected_level_actors(previous_selection)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"T3D export failed or produced an empty file: {path}")
+    return path
+
+
+def _t3d_parse(text) -> list[dict]:
+    blocks = []
+    stack = []
+    for line_index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("Begin Object"):
+            class_match = re.search(r"Class=([^\s]+)", stripped)
+            name_match = re.search(r'Name="([^"]+)"', stripped)
+            path_match = re.search(r'ExportPath="([^"]+)"', stripped)
+            blocks.append({
+                "class": class_match.group(1) if class_match else "",
+                "name": name_match.group(1) if name_match else "",
+                "export_path": path_match.group(1) if path_match else "",
+                "start": line_index,
+                "end": None,
+                "parent": stack[-1] if stack else None,
+            })
+            stack.append(len(blocks) - 1)
+        elif stripped.startswith("End Object") and stack:
+            blocks[stack.pop()]["end"] = line_index
+    return blocks
+
+
+@command("verse.find_device")
+def _cmd_verse_find_device(query: str = "", class_filter: str = "VerseDevice_C") -> dict:
+    devices = []
+    query_lower = query.lower()
+    for actor in _get_actor_sub().get_all_level_actors():
+        class_name = actor.get_class().get_name()
+        if class_filter and class_name != class_filter:
+            continue
+        if query and actor.get_name() != query and query_lower not in actor.get_actor_label().lower():
+            continue
+        try:
+            folder = str(actor.get_folder_path())
+        except Exception:
+            folder = ""
+        devices.append({
+            "name": actor.get_name(),
+            "label": actor.get_actor_label(),
+            "class": class_name,
+            "path": actor.get_path_name(),
+            "folder": folder,
+        })
+    return {"devices": devices, "count": len(devices)}
+
+
+@command("verse.export_t3d")
+def _cmd_verse_export_t3d(target: str, filename: str = "") -> dict:
+    """Export one device. Parse the file programmatically, never dump raw T3D
+    at the user; this is the only reliable read path for Verse strings and enums.
+    """
+    actor = _find_actor(target)
+    path = _export_t3d_impl(actor, filename)
+    return {"file": path, "size_bytes": os.path.getsize(path), "target": actor.get_name()}
+
+
+@command("verse.get_properties")
+def _cmd_verse_get_properties(path: str, properties: List[str]) -> dict:
+    """Read subobject properties. VerseStringProperty fields always error here
+    by design; read them via verse.export_t3d instead.
+    """
+    obj = unreal.load_object(None, path)
+    if obj is None:
+        raise ValueError(f"Object not found: {path}")
+    values = {}
+    for property_name in properties:
+        try:
+            values[property_name] = to_json_safe(obj.get_editor_property(property_name))
+        except Exception as exc:
+            values[property_name] = f"<error: {exc}>"
+    return {"path": path, "class": obj.get_class().get_name(), "properties": values}
+
+
+@command("verse.set_property")
+def _cmd_verse_set_property(
+    path: str,
+    property_name: str,
+    value: Any = None,
+    is_object_ref: bool = False,
+    transaction: str = "",
+) -> dict:
+    """Write numeric, object-reference, and object-reference-array properties.
+    Verse strings, enums, and options need the clipboard T3D roundtrip via exec;
+    see RULES.md.
+    """
+    obj = unreal.load_object(None, path)
+    if obj is None:
+        raise ValueError(f"Object not found: {path}")
+    resolved_value = value
+    if is_object_ref:
+        resolved_value = unreal.load_object(None, value)
+        if resolved_value is None:
+            try:
+                resolved_value = _find_actor(value)
+            except Exception:
+                resolved_value = None
+        if resolved_value is None:
+            raise ValueError(f"Reference not found: {value}")
+    with unreal.ScopedEditorTransaction(transaction or f"Set {property_name}"):
+        obj.modify()
+        obj.set_editor_property(property_name, resolved_value)
+    return {"path": path, "property": property_name, "value": to_json_safe(resolved_value)}
+
+
 # ── Batch / utility commands ──────────────────────────────────────────────
 
 
@@ -828,6 +1032,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         cmd = payload.get("command", "")
         params = payload.get("params", {})
+        timeout_s = payload.get("timeout_s")
+        request_timeout_s = (
+            max(1.0, min(600.0, float(timeout_s)))
+            if isinstance(timeout_s, (int, float)) else REQUEST_TIMEOUT_S
+        )
         if not cmd:
             self._respond(400, json.dumps({"ok": False, "error": "Missing 'command'"}).encode())
             return
@@ -856,7 +1065,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # fall through to poll loop either way
 
-        deadline = time.monotonic() + REQUEST_TIMEOUT_S
+        deadline = time.monotonic() + request_timeout_s
         throttle_retry = False
         while time.monotonic() < deadline:
             with _results_lock:
@@ -866,11 +1075,11 @@ class _Handler(BaseHTTPRequestHandler):
                     return
             # If we've waited more than half the timeout, try re-disabling
             # background throttle in case user re-enabled it
-            if not throttle_retry and (time.monotonic() - deadline + REQUEST_TIMEOUT_S) > REQUEST_TIMEOUT_S * 0.5:
+            if not throttle_retry and (time.monotonic() - deadline + request_timeout_s) > request_timeout_s * 0.5:
                 throttle_retry = True
                 _disable_background_throttle()
             time.sleep(POLL_SLEEP_S)
-        self._respond(504, json.dumps({"ok": False, "error": f"'{cmd}' timed out ({REQUEST_TIMEOUT_S}s). Unreal API calls require the editor main thread — ensure UEFN is focused."}).encode())
+        self._respond(504, json.dumps({"ok": False, "error": f"'{cmd}' timed out ({request_timeout_s}s). Unreal API calls require the editor main thread; ensure UEFN is focused."}).encode())
 
     # Allow cross-origin for web-based tools
     def do_OPTIONS(self) -> None:

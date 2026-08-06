@@ -314,6 +314,10 @@ Response:
 | `viewport.camera` | Get camera position/rotation |
 | `viewport.set_camera` | Move viewport camera |
 | `materials.create_instance` | Create material instance with params |
+| `verse.find_device` | Find placed Verse device actors by internal name or label query |
+| `verse.export_t3d` | Export one device's complete serialized state |
+| `verse.get_properties` | Read supported properties from a generated subobject path |
+| `verse.set_property` | Write numeric and object-reference properties |
 | `batch.exec` | Run multiple commands in one tick |
 | `undo` | Undo last action |
 | `redo` | Redo last undone action |
@@ -345,6 +349,141 @@ domains with full read/write support:
 - No spawning Fortnite actors from Python
 - No Verse bridge (can inspect but not call)
 - Editor use: asset validation, bulk editing, quest tools
+
+## Editing Placed Verse Devices (@editable values)
+
+### Mental model
+
+A placed Verse device is a wrapper actor whose class is usually `VerseDevice_C`.
+The editable data lives in a generated subobject chain below that actor:
+
+```text
+VerseDevice_C_UAID_...
+  generated_verse_class_0
+    nested_config_1
+      array_element_2
+```
+
+Generated property names look like `__verse_0xHASH_FieldName`.
+Always copy the exact serialized property name from T3D.
+Never guess the hash or strip it from the name.
+
+Object references inside a block can be relative names such as `'config_2'`.
+Subobject names are unique only within their outer object.
+Use full object paths when loading objects from Python.
+
+Verse enums serialize by value name.
+Delta serialization omits an enum property when it has the default value.
+An absent enum line means default, not missing data.
+
+Verse options serialize with parentheses around their contained value.
+Arrays serialize as indexed property lines such as `MyArray(0)=...`.
+The indexed lines define array order, not numeric suffixes in object names.
+
+### Universal read path: T3D export
+
+Use `verse.find_device` to resolve the wrapper actor by internal name.
+Labels are not unique, so keep the returned internal `UAID` name and full path.
+
+Use `verse.export_t3d` to export only that actor.
+Large devices can produce multi-megabyte files, so use `timeout_s` when needed.
+Parse the file programmatically and never dump raw T3D into the conversation.
+
+Use a depth-aware stack parser for `Begin Object` and `End Object` lines.
+The `t3d_parse` helper is available inside the `exec` namespace.
+Every subobject appears twice in an export:
+
+1. A declaration block has `Class=`, `Name=`, and `ExportPath=`.
+2. An instance block has no `Class=` and contains serialized property values.
+
+Match blocks by full `ExportPath`, not by `Name` alone.
+Treat the exported T3D as ground truth for current values.
+Read the authored Verse source first for type meaning and runtime overrides.
+
+### What plain Python property access can write
+
+Load generated objects with `unreal.load_object(None, full_path)`.
+Use exact serialized names with `get_editor_property` and `set_editor_property`.
+The bridge commands `verse.get_properties` and `verse.set_property` cover this path.
+
+Proven writable through Python:
+
+- Numeric and float properties.
+- Object references, including `SavedActor`.
+- Arrays of object references by reading, appending, and setting the list back.
+- Moving a subobject with `obj.rename(name=..., outer=...)`.
+- Creating a subobject with `unreal.new_object(cls, outer=..., name=...)`.
+
+`VerseStringProperty` reads and writes always fail through Python conversion.
+Verse enum and option conversion is not reliable enough to use directly.
+Use the editor text-import clipboard route for strings, enums, and options.
+Never use the class-wide `SET` console command because it can change every instance.
+
+### Clipboard T3D roundtrip
+
+The `exec` namespace provides `clip_get`, `clip_set`, `export_t3d`,
+`t3d_parse`, and `find_actor` so the entire roundtrip stays in one call.
+Run all steps in one `exec` call and one `ScopedEditorTransaction`.
+Use `try/finally` to restore selection and clipboard state and destroy temp actors.
+
+1. Load the real owner and array by full path.
+   Assert the current length and expected donor object.
+   Assert the destination name does not already exist.
+   Verify every referenced asset with `EditorAssetLibrary.does_asset_exist`.
+
+2. Save the current selection and clipboard text.
+   Select only the real device actor.
+   Run `EDIT COPY`, wait briefly, then call `clip_get()`.
+   Assert the copied text contains a known marker.
+
+3. Parse the copied text with a stack parser.
+   Locate the donor in both declaration and instance segments.
+   Match `Name` plus the owning path in `ExportPath` because names repeat.
+   Locate the final indexed array property line on the real owner.
+
+4. Clone the donor declaration block and instance block.
+   Choose the next free numeric suffix under that outer.
+   Replace the donor name in `Name=` and `ExportPath=` values.
+   Keep nested declaration names scoped inside the cloned block.
+   Change only the required string, enum, option, asset, or actor values.
+   Insert a missing enum line when the donor uses its omitted default.
+   Append the new indexed array line with matching indentation.
+   Apply text insertions in descending line-index order.
+
+5. Call `clip_set(new_text)` and run `EDIT PASTE`.
+   Diff actor internal names before and after the paste.
+   Assert exactly one temporary duplicate actor appeared.
+
+6. Load each new element below the temporary actor.
+   Load its real destination outer by full path.
+   Call `real_owner.modify()` before mutation.
+   Rename the element into the real outer with `rename`.
+   Append the element to the real object-reference array.
+   Set the array property back and assert the new length.
+
+7. Destroy the temporary actor after every transplant succeeds.
+   In `finally`, destroy it if it still exists.
+   Restore the previous selection and original clipboard text.
+
+### Verification and saving
+
+Read back array lengths, object names, outers, references, and numeric values.
+Re-export T3D with `export_t3d` or `verse.export_t3d`.
+Search for every exact expected string, enum, option, and array line.
+Confirm pre-existing entries remain unchanged.
+Only save the level after both Python readback and T3D verification pass.
+Writes mutate the open level, so get user approval before editing or saving.
+
+### Hard rules for device edits
+
+- Use exact serialized names and hashes from T3D only.
+- Make scripts idempotent by checking names and values before adding anything.
+- Never edit `.uasset`, `.umap`, `__ExternalActors__`, or `__ExternalObjects__` on disk.
+- Resolve placed actors by internal name, not label.
+- Never run shell subprocesses from editor Python.
+- Avoid `unreal.ObjectIterator` sweeps because they can crash the editor.
+- Verify every referenced asset or actor exists before writing it.
+- Never replace the real device actor or import a whole map.
 
 ## Critical Rules
 
