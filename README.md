@@ -1,59 +1,129 @@
-# UEFN Python Bridge
+# UEFN Hybrid Python Bridge
 
-A tiny HTTP server that runs inside UEFN and lets anything on your machine talk to the editor — AI agents, Python scripts, Node apps, curl one-liners, whatever speaks HTTP.
+A local HTTP bridge for programmatic UEFN editor automation. It keeps the fast embedded-Python path for everything Python can handle, calls Epic's creator-exposed tools through the in-process Toolset Registry when needed, and uses Epic's official UEFN MCP server only as a last-resort transport.
 
-You send a JSON command, the bridge executes it on the main editor thread, and sends back the result. That's the whole idea.
+All access is through HTTP or embedded Python. The bridge does not use desktop or UI automation.
 
-## Why
+## Routing Strategy
 
-UEFN doesn't expose its Python API to anything outside the editor process. This bridge fixes that. Once it's running, any tool that can make an HTTP request can spawn actors, move things around, search assets, change materials, read properties, and run arbitrary Python inside the editor.
+Every request follows a deterministic route:
 
-No plugins, no C++, no MCP, no SDK. Just a Python script and HTTP.
+| Priority | Response `route` | Used for |
+|---|---|---|
+| 1 | `python` | Existing bridge commands for actors, assets, levels, materials, viewport control, and placed Verse-device inspection |
+| 2 | `toolset_registry` | Epic creator-exposed toolsets called directly inside UEFN, without MCP transport overhead |
+| 3 | `mcp` | Official loopback UEFN MCP when the requested capability or local registry is unavailable before dispatch |
 
-## The Fastest Way to Start
+Named direct commands never detour through MCP. The 42 UEFN-specific friendly aliases and `toolsets.*` commands try the local Toolset Registry first. The `mcp.*` commands explicitly bypass local routing for diagnostics or compatibility testing.
 
-Paste this into any AI agent (Claude Code, Cursor, ChatGPT, whatever):
+Fallback is mutation-safe. Once a Toolset Registry or MCP call may have started, a timeout, disconnect, malformed response, or unknown result is returned with `"outcome_unknown": true` and is not replayed through another route. This prevents duplicate entities, devices, file writes, sessions, or event bindings.
+
+## Why Hybrid
+
+UEFN's Python API is fast and broad for normal editor automation, but some Fortnite-specific operations are not available through `unreal.*`. Epic's creator toolsets add Verse-file, play-session, device, and Scene Graph entity capabilities. Calling those toolsets through the in-process registry avoids the fixed HTTP and discovery cost of MCP whenever possible.
+
+Epic currently lists editor slowdowns and hangs during MCP calls as a known issue. Keeping MCP as the final route makes the common path responsive while retaining the capabilities that only Epic's toolsets expose.
+
+Official references:
+
+- [Unreal MCP is now available in UEFN](https://www.fortnite.com/news/unreal-mcp-is-now-available-in-uefn)
+- [UEFN MCP setup and known issues](https://dev.epicgames.com/documentation/fortnite/uefn-mcp)
+- [Unreal MCP architecture](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor)
+
+## Fastest Setup
+
+Paste this into an AI coding agent:
 
 > Clone https://github.com/Valid/uefn-python-bridge and help me set it up with my UEFN project.
 
-It'll read the included [`RULES.md`](RULES.md), walk you through the two setup steps, and start controlling your editor.
+The included [`RULES.md`](RULES.md) explains the routing contract and working UEFN Python patterns.
 
-## Setup (Manual)
+## Manual Setup
 
-**Step 1: Turn on Python scripting**
+### 1. Enable embedded Python
 
-In UEFN: **Project dropdown → Project Settings → Enable Python Editor Scripting**
+In UEFN Project Settings, enable `Python Editor Scripting`. This is the only requirement for the existing direct Python commands.
 
-**Step 2: Run the bridge**
+### 2. Enable Epic's creator toolsets
 
-In UEFN: **Tools → Execute Python Script** → pick `bridge/server.py`
+For the Toolset Registry and MCP capabilities, enable `UEFN MCP Toolsets` in Project Settings. Apply any restart requested by UEFN.
 
-That's it. You'll see this in the Output Log:
+### 3. Enable the official MCP server
 
+In Editor Preferences, open `General > Model Context Protocol` and enable `Auto Start Server`.
+
+The default endpoint is:
+
+```text
+http://127.0.0.1:8000/mcp
 ```
-[Bridge] Bridge v0.2.0 listening on http://127.0.0.1:9210
-[Bridge] 39 commands registered
+
+The bridge accepts only a loopback MCP endpoint. To use a different loopback port or path, either set `UEFN_MCP_URL` in UEFN's process environment before running the bridge or configure it at runtime:
+
+```json
+{
+  "command": "mcp.configure",
+  "params": {"url": "http://127.0.0.1:8123/mcp"}
+}
 ```
 
-The bridge is now accepting commands.
+You can also manage Epic's server from the UEFN console with `ModelContextProtocol.StartServer [port]`, `ModelContextProtocol.StopServer`, and `ModelContextProtocol.RefreshTools`.
+
+### 4. Run the bridge
+
+In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
+
+The Output Log should include:
+
+```text
+[Bridge 12:34:56] Bridge v0.3.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] 90 commands registered
+```
+
+The bridge checks ports 9210 through 9220 and uses the first available port.
+If it selects a port other than 9210, pass the logged port to
+`UEFNBridge(port=...)` or use that port in raw HTTP requests.
 
 ## Sending Commands
 
 Every command is a POST to `http://127.0.0.1:9210` with a JSON body:
+
+Requests must use `Content-Type: application/json` and are limited to 16 MiB.
+Browser requests with a non-loopback `Origin` are rejected, and both bundled
+clients bypass environment HTTP proxies for their loopback connections.
 
 ```json
 {"command": "actors.list"}
 ```
 
 ```json
-{"command": "actors.spawn", "params": {"actor_class": "PointLight", "location": [0, 0, 200]}}
+{
+  "command": "actors.spawn",
+  "params": {
+    "actor_class": "PointLight",
+    "location": [0, 0, 200]
+  }
+}
 ```
 
 ```json
-{"command": "exec", "params": {"code": "result = len(unreal.get_editor_subsystem(unreal.EditorActorSubsystem).get_all_level_actors())"}}
+{
+  "command": "session.status",
+  "timeout_s": 120
+}
 ```
 
-The response is always `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`.
+The complete response envelope includes the route that actually handled the request:
+
+```json
+{
+  "ok": true,
+  "route": "toolset_registry",
+  "result": {}
+}
+```
+
+An MCP fallback also includes `fallback_reason`. Failures whose side effect cannot be determined include `outcome_unknown`.
 
 ### Python Client
 
@@ -63,179 +133,282 @@ from bridge.client import UEFNBridge
 ue = UEFNBridge()
 print(ue.status())
 
-# List every actor in the level
+# Existing capability: direct embedded Python.
 actors = ue.actors()
+print(ue.last_route)  # python
 
-# Spawn a light
-ue.spawn(actor_class="PointLight", location=[500, 0, 100], label="MyLight")
+# UEFN-specific capability: local registry first, MCP only on a safe miss.
+session = ue.run("session.status", timeout_s=120)
+print(ue.last_route)  # toolset_registry or mcp
 
-# Run arbitrary Python inside the editor
-count = ue.exec("result = 42 * 10")
+# Generic approved tool lookup and call.
+toolsets = ue.toolsets()
+schema = ue.describe_toolset("ValkyrieToolset.SessionToolset")
+status = ue.call_tool(
+    "ValkyrieToolset.SessionToolset",
+    "GetSessionStatus",
+)
+
+# Force MCP only when diagnosing the official transport.
+mcp_status = ue.run("mcp.status", timeout_s=120)
 ```
+
+`UEFNBridge.run()` returns only the result. Use `UEFNBridge.request()` when you need the complete envelope, or inspect `ue.last_response` and `ue.last_route` after a call. `UEFNBridge.planned_route(command)` explains the initial route without contacting UEFN.
 
 ### curl
 
 ```bash
-# List actors
 curl -s -X POST http://127.0.0.1:9210 \
   -H "Content-Type: application/json" \
-  -d '{"command": "actors.list"}' | python -m json.tool
-
-# Spawn a cube
-curl -s -X POST http://127.0.0.1:9210 \
-  -H "Content-Type: application/json" \
-  -d '{"command": "actors.spawn", "params": {"asset_path": "/Engine/BasicShapes/Cube", "location": [0, 0, 200]}}'
+  -d '{"command":"actors.list"}' | python -m json.tool
 ```
 
-### JavaScript / TypeScript
+```bash
+curl -s -X POST http://127.0.0.1:9210 \
+  -H "Content-Type: application/json" \
+  -d '{"command":"session.status","timeout_s":120}' | python -m json.tool
+```
+
+### JavaScript or TypeScript
 
 ```javascript
-const res = await fetch("http://127.0.0.1:9210", {
+const response = await fetch("http://127.0.0.1:9210", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    command: "actors.spawn",
-    params: { actor_class: "PointLight", location: [0, 0, 200], label: "MyLight" }
-  })
+  body: JSON.stringify({ command: "actors.list" })
 });
-const { result } = await res.json();
+
+const envelope = await response.json();
+console.log(envelope.route, envelope.result);
 ```
 
-## What Commands Exist
+## Direct Python Commands
 
-**Actors** — find, spawn, duplicate, delete, move, read/write properties, change color
+These commands always use the embedded-Python route.
 
-| Command | What it does | Key params |
-|---------|-------------|------------|
-| `actors.list` | All actors in the level | — |
-| `actors.selected` | Currently selected actors | — |
-| `actors.spawn` | Create a new actor | `actor_class` or `asset_path`, `location`, `label` |
-| `actors.duplicate` | Clone an existing actor (keeps mesh, materials, everything) | `source`, `location`, `label` |
-| `actors.delete` | Remove actors | `targets` (list of labels) |
-| `actors.transform` | Move / rotate / scale | `target`, `location`, `rotation`, `scale` |
-| `actors.properties` | List all editable properties | `target` |
-| `actors.set_property` | Set a property value | `target`, `property_name`, `value` |
-| `actors.set_color` | Apply a solid color (creates a persistent material) | `target`, `color` ([r,g,b,a] 0–1) |
-
-**Assets** — search the content browser, check paths, manage files
+### Actors
 
 | Command | What it does | Key params |
-|---------|-------------|------------|
-| `assets.search` | Find assets by keyword (returns spawnable props by default) | `query` ("chair", "lamp", etc.) |
-| `assets.list` | List assets in a directory | `path`, `recursive` |
-| `assets.info` | Details about one asset | `path` |
-| `assets.exists` | Check if an asset path is valid | `path` |
+|---|---|---|
+| `actors.list` | List level actors | `class_filter` |
+| `actors.selected` | List selected actors | None |
+| `actors.spawn` | Spawn from a class or asset | `actor_class` or `asset_path`, `location`, `label` |
+| `actors.duplicate` | Clone an actor | `source`, `location`, `label` |
+| `actors.delete` | Delete actors | `targets` |
+| `actors.transform` | Set location, rotation, or scale | `target`, `location`, `rotation`, `scale` |
+| `actors.properties` | Read named editable properties | `target`, `properties` |
+| `actors.set_property` | Set an editor property | `target`, `property_name`, `value` |
+| `actors.set_color` | Create and apply a persistent solid-color material | `target`, `color` |
 
-**Verse devices**
+### Assets
 
 | Command | What it does | Key params |
-|---------|-------------|------------|
+|---|---|---|
+| `assets.search` | Search spawnable assets by default | `query` |
+| `assets.list` | List a content directory | `directory`, `recursive` |
+| `assets.info` | Inspect one asset | `path` |
+| `assets.exists` | Check an asset path | `path` |
+| `assets.rename` | Rename or move an asset | `old_path`, `new_path` |
+| `assets.duplicate` | Copy an asset | `source`, `destination` |
+| `assets.delete` | Delete an asset | `path` |
+| `assets.save` | Save an asset | `path` |
+| `assets.selected` | List Content Browser selection | None |
+| `assets.import_task` | Import an external file | `source_file`, `destination_path` |
+
+### Placed Verse Devices
+
+| Command | What it does | Key params |
+|---|---|---|
 | `verse.find_device` | Find placed Verse device actors | `query`, `class_filter` |
-| `verse.export_t3d` | Export one device's complete serialized state | `target`, `filename` |
-| `verse.get_properties` | Read supported generated subobject properties | `path`, `properties` |
+| `verse.export_t3d` | Export complete serialized device state | `target`, `filename` |
+| `verse.get_properties` | Read generated subobject properties | `path`, `properties` |
 | `verse.set_property` | Write supported generated subobject properties | `path`, `property_name`, `value`, `is_object_ref` |
 
-**Level & Viewport**
+These direct `verse.*` commands inspect placed generated device objects. They are separate from the creator-toolset `verse.*` file aliases below.
+
+### Level, Viewport, Materials, and System
 
 | Command | What it does |
-|---------|-------------|
-| `level.info` | Current level name, path, actor count |
-| `level.save` | Save the level |
-| `viewport.camera` | Get camera position/rotation |
+|---|---|
+| `level.info` | Read current level information |
+| `level.save` | Save the current level |
+| `viewport.camera` | Read viewport location and rotation |
 | `viewport.set_camera` | Move the viewport camera |
+| `materials.create_instance` | Create a material instance with parameters |
+| `status` | Return version, routing configuration, and commands |
+| `exec` | Run embedded Python and return the variable named `result` |
+| `batch.exec` | Run direct Python commands in one undo transaction and main-thread tick |
+| `undo`, `redo` | Use the editor transaction history |
+| `log`, `history` | Inspect bridge diagnostics |
+| `reload`, `shutdown` | Manage the bridge process |
+| `fix_throttle` | Disable background CPU throttling |
+| `store.install` | Install the persistent helper store |
 
-**System**
+`batch.exec` accepts direct Python commands only. Toolset Registry and MCP calls are asynchronous and serialized, so friendly aliases and all `toolsets.*` or `mcp.*` commands are rejected inside a batch.
 
-| Command | What it does |
-|---------|-------------|
-| `status` | Bridge version, uptime, command count |
-| `exec` | Run arbitrary Python (set `result = ...` to return data) |
-| `batch.exec` | Run multiple commands in a single undo transaction |
-| `undo` / `redo` | Undo or redo the last operation |
-| `reload` | Hot-reload the bridge from disk (no UEFN restart needed) |
-| `fix_throttle` | Disable "Use Less CPU in Background" so commands work when UEFN isn't focused |
+## UEFN-Specific Friendly Aliases
+
+Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable bridge command names. Pass the official tool arguments directly as `params`.
+
+| Domain | Friendly aliases |
+|---|---|
+| Python setup | `uefn.python_enabled`, `uefn.enable_python` |
+| Verse files and build | `verse.write_file`, `verse.replace`, `verse.read_file`, `verse.move`, `verse.list_files`, `verse.grep`, `verse.delete`, `verse.create_directory`, `verse.copy`, `verse.build` |
+| Play session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log` |
+| Creative devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding` |
+| Scene Graph entities | `entities.set_transform`, `entities.set_component_property`, `entities.remove_component`, `entities.list_classes`, `entities.list_component_properties`, `entities.list_component_classes`, `entities.get_transform`, `entities.get_components`, `entities.get_component_property`, `entities.find`, `entities.delete`, `entities.create`, `entities.add_component` |
+
+Use `toolsets.describe` before the first unfamiliar call. Epic's JSON schema is the source of truth for parameter names, required fields, object reference shapes, and result values. When a schema requests an Unreal object reference, it commonly uses a JSON object such as `{"refPath":"/Path/To/Object"}`. Do not substitute that shape where a tool expects a plain string.
+
+## Generic Creator Toolsets
+
+The bridge pins local routing to Epic's creator-exposed UEFN v42 policy: `UEFN-v42-CL-56878558`. The manifest contains exactly 29 toolsets and 384 approved tools. This prevents registered editor-internal toolsets or hidden tools from becoming available through the fast local path.
+
+| Command | Purpose |
+|---|---|
+| `toolsets.list` | List locally approved toolsets, with MCP fallback if the registry is unavailable |
+| `toolsets.describe` | Return the full schema for one toolset |
+| `toolsets.call` | Call an exact `toolset_name` and `tool_name` locally first |
+
+Example:
+
+```json
+{
+  "command": "toolsets.call",
+  "params": {
+    "toolset_name": "ValkyrieToolset.SessionToolset",
+    "tool_name": "GetSessionStatus",
+    "arguments": {},
+    "allow_mcp_fallback": true
+  },
+  "timeout_s": 120
+}
+```
+
+Set `allow_mcp_fallback` to `false` when you explicitly require local execution. If UEFN adds a tool after the pinned v42 policy, that tool is not executed through the local registry until the policy is reviewed. An exact generic call may still reach the official MCP server as a pre-dispatch capability fallback.
+
+Tool names can collide across toolsets. Always provide the full toolset name and the exact tool name returned by its schema.
+
+## Forced MCP Commands
+
+Use these only when you intentionally need the official HTTP path:
+
+| Command | Purpose |
+|---|---|
+| `mcp.status` | Initialize the MCP session and report negotiation state |
+| `mcp.list_toolsets` | List toolsets through MCP |
+| `mcp.describe_toolset` | Fetch one toolset schema through MCP |
+| `mcp.call` | Invoke one tool through MCP |
+| `mcp.configure` | Change the loopback endpoint and reset the session |
+| `mcp.reset` | Close and discard the cached MCP session |
+
+The MCP client uses Streamable HTTP, negotiates one session lazily, serializes requests through a single mutex, and caches discovery results per session. It accepts JSON and server-sent event responses. It does not use stdio, WebSocket, browser control, or UI automation.
+
+## Mutation and Session Safety
+
+- Treat `outcome_unknown: true` as a hard stop. Inspect current editor state before deciding whether another operation is needed.
+- Do not automatically retry file writes, builds, entity or device mutations, event bindings, or session controls.
+- Read-only discovery can be refreshed deliberately with `refresh: true`.
+- Toolset schemas are cached locally. Use `toolsets.list` or `toolsets.describe` with `refresh: true` after a UEFN tool refresh.
+- MCP discovery is cached for its session. Use `mcp.reset` after restarting Epic's server or changing its tool configuration.
+- MCP requests are serialized, and Toolset Registry dispatch runs on UEFN's main editor thread. Do not issue overlapping session or mutation calls.
+- If a session result reports `StillRunning`, poll `session.status` before issuing another session mutation.
+
+Epic's UEFN session tools operate Play in Client (PIC) sessions. Do not assume Play in Editor (PIE) behavior or state.
+
+## Coordinates and Scene Graph
+
+UEFN currently has two coordinate naming conventions in related APIs:
+
+- Unreal Python and the creator toolset JSON schemas use X, Y, and Z.
+- UEFN Scene Graph and `/Verse.org/SpatialMath` use Forward, Left, and Up (LUF).
+
+For `entities.*` calls, send the X, Y, and Z field names required by the tool schema, even though the affected Scene Graph transform is represented as LUF in Verse. Do not rename fields or swap axes by intuition. The older `/UnrealEngine.com/Temporary/SpatialMath` types are also distinct from `/Verse.org/SpatialMath`; use the documented Verse conversion functions when crossing between them.
 
 ## Editing Placed Verse Devices
 
-Find the placed `VerseDevice_C` actor by internal name, then export its complete serialized state for programmatic inspection.
+Find a placed `VerseDevice_C` actor by internal name, then export its serialized state for programmatic inspection:
 
 ```json
-{"command": "verse.find_device", "params": {"query": "game manager"}}
-{"command": "verse.export_t3d", "params": {"target": "VerseDevice_C_UAID_ABC123"}, "timeout_s": 120}
+{"command":"verse.find_device","params":{"query":"game manager"}}
 ```
 
-Plain property access works for numbers, object references, and reference arrays. Verse string, enum, and option values can only be written through the editor's own text import, which the bridge supports with clipboard helpers inside `exec`; the full procedure is in [`RULES.md`](RULES.md). Writes mutate the open level, so an agent must get user approval before editing or saving.
-
-## Using with AI Agents
-
-The repo includes [`RULES.md`](RULES.md) — a context file that teaches LLMs how to write working UEFN Python. Drop it into your tool:
-
-| Tool | Where to put it |
-|------|----------------|
-| Cursor | `.cursorrules` in project root |
-| Claude Code | `CLAUDE.md` in project root |
-| OpenClaw | Skill's `SKILL.md` |
-| ChatGPT / Gemini / others | Paste into system prompt |
-
-## How It Works Under the Hood
-
-UEFN's Python API (`unreal.*`) can only be called from the main editor thread. The bridge works around this:
-
-1. An HTTP server runs on a background thread, listening on `127.0.0.1:9210`
-2. When a command arrives, it's queued for the main thread
-3. A Slate tick callback picks up the command on the next editor frame and executes it
-4. The result goes back to the HTTP response
-
-Some commands (`status`, `log`, `history`, `fix_throttle`) are thread-safe and skip the queue entirely for instant responses.
-
-On startup, the bridge automatically disables UEFN's background CPU throttle so commands work even when the editor isn't focused.
-
-## Repo Layout
-
+```json
+{
+  "command": "verse.export_t3d",
+  "params": {
+    "target": "VerseDevice_C_UAID_ABC123"
+  },
+  "timeout_s": 120
+}
 ```
+
+Plain property access works for numbers, object references, and reference arrays. Verse string, enum, and option values require the editor text-import roundtrip documented in [`RULES.md`](RULES.md). Writes mutate the open level, so get user approval before editing or saving.
+
+## How It Works
+
+1. A local HTTP server listens on `127.0.0.1:9210` or the next free bridge port.
+2. Direct commands that touch Unreal are queued to UEFN's main editor thread and executed on a Slate tick.
+3. Creator-toolset calls are dispatched through `unreal.ToolsetRegistry` on the editor thread and polled on later ticks, without blocking UEFN in a busy loop.
+4. A proven pre-dispatch capability miss is handed to the official loopback MCP client on the HTTP worker thread.
+5. Results return in one bridge envelope with the actual route and safety metadata.
+
+The local toolset schema cache avoids repeated discovery. MCP maintains its own session-scoped discovery caches and serializes its HTTP requests. Registry dispatch stays on UEFN's main editor thread. Callers should not overlap Epic tool operations.
+
+On startup, the bridge disables UEFN's background CPU throttle so commands continue while the editor is not focused.
+
+## Repository Layout
+
+```text
 bridge/
-  server.py         ← the HTTP server (runs inside UEFN)
-  client.py         ← Python client library (runs on your machine)
-  startup.py        ← auto-start helper (standard UE5 only, not UEFN)
+  server.py            HTTP bridge and hybrid router, runs inside UEFN
+  client.py            Local Python client
+  routes.py            Direct-command and 42-alias routing metadata
+  uefn_tool_policy.py  Exact UEFN v42 local tool allowlist
+  mcp_client.py        Stdlib-only official UEFN MCP client
+  startup.py           Optional UEFN init_unreal.py auto-start helper
 
-tools/
-  introspect_api.py ← dump every available unreal.* type to JSON
-  generate_stubs.py ← create .pyi stubs for IDE autocomplete
+examples/
+  hybrid_routing.py    Read-only routing and discovery example
+  verse_devices.py     Placed Verse device workflow
 
-examples/           ← working examples for actors, assets, materials, batching
-  verse_devices.py  ← placed Verse device inspection and editing workflow
-
-RULES.md            ← LLM context file — the cheat sheet for AI agents
+tests/                 Unit tests that run outside UEFN with fakes
+tools/                 API introspection and stub-generation helpers
+RULES.md               LLM context and operating rules
 ```
 
 ## IDE Autocomplete
 
-Want autocomplete for `unreal.*` in VS Code or Cursor?
+1. In UEFN, choose `Tools > Execute Python Script` and run `tools/generate_stubs.py`.
+2. Find `unreal.pyi` under your project's `Saved` directory.
+3. Add that directory to your Python analysis paths.
 
-1. In UEFN: **Tools → Execute Python Script** → `tools/generate_stubs.py`
-2. Find the generated `unreal.pyi` in `<YourProject>/Saved/`
-3. Add to your editor settings:
 ```json
-{ "python.analysis.extraPaths": ["path/to/Saved"] }
+{
+  "python.analysis.extraPaths": ["path/to/Saved"]
+}
 ```
 
 ## Good to Know
 
-- **UEFN ≠ Unreal Engine.** Lots of standard UE5 Python APIs are stripped or changed. `RULES.md` documents what actually works.
-- **Background throttle.** UEFN slows down when it's not focused. The bridge disables this automatically, but if commands start timing out, run `fix_throttle` or just click the UEFN window.
-- **Long operations.** Any command payload may carry a top-level `"timeout_s"` in seconds, up to 600. The Python client exposes it as `run(..., timeout_s=...)`.
-- **Port conflicts.** If UEFN crashes while the bridge is running, the port might stay bound. Restarting UEFN clears it. The bridge auto-detects this and picks a free port.
-- **Auto-start doesn't work in UEFN.** `init_unreal.py` only works in standard Unreal Engine. In UEFN you run the script manually via **Tools → Execute Python Script** each session.
-- **Hot reload.** Changed `server.py`? Send `{"command": "reload"}` — no need to restart UEFN.
+- UEFN is not standard Unreal Engine. Many standard UE5 Python APIs are stripped or changed. See [`RULES.md`](RULES.md) for tested patterns.
+- Epic documents editor hitching or hanging during MCP calls. Prefer direct Python and the in-process registry.
+- Any request can include a top-level `timeout_s` up to 600 seconds. A timeout after dispatch is not proof that the operation failed.
+- If background throttling returns, run `fix_throttle` or focus UEFN.
+- Start manually with `bridge/server.py`, or copy `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside the `bridge/` package for project auto-start.
+- Use `reload` after changing only `bridge/server.py`. Restart UEFN after changing sibling modules such as `routes.py`, `uefn_tool_policy.py`, or `mcp_client.py`; simply re-running `server.py` does not evict those modules from Python's import cache.
+- The bridge only connects to loopback MCP endpoints and has no remote-access mode.
 
 ## Contributing
 
-PRs welcome. To add a command:
+To add a direct Python command:
 
-1. Add a function with the `@command("category.name")` decorator in `server.py`
-2. Add type hints and a docstring
-3. Add a working example in `examples/`
-4. Update `RULES.md`
+1. Add a function with `@command("category.name")` in `bridge/server.py`.
+2. Add the command to `PYTHON_COMMANDS` in `bridge/routes.py`.
+3. Add tests and a working example.
+4. Update `RULES.md` and this README.
+
+When Epic changes its creator toolsets, review the official exposed schemas before updating `bridge/uefn_tool_policy.py`. Do not widen the local policy from registered toolsets alone.
 
 ## Support
 

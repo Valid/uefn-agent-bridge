@@ -27,7 +27,7 @@ def _boot_bridge() -> None:
     except ImportError:
         unreal.log_warning(
             "[Bridge] bridge/server.py not found.  "
-            "Copy the bridge/ folder to Content/Python/ — "
+            "Copy the bridge/ folder to Content/Python/ - "
             "see https://github.com/Valid/uefn-python-bridge"
         )
     except Exception as exc:

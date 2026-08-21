@@ -1,4 +1,4 @@
-"""UEFN Python Bridge — HTTP server that runs inside the UEFN editor.
+"""UEFN Python Bridge - HTTP server that runs inside the UEFN editor.
 
 Provides a local REST API so external tools (AI agents, scripts, CI pipelines)
 can execute Python inside the editor.  All `unreal.*` calls are routed to the
@@ -16,12 +16,13 @@ Docs & source: https://github.com/Valid/uefn-python-bridge
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import os
 import re
 import tempfile
 
-# Store script path at load time — __file__ may not exist when run via UEFN's Execute Python Script
+# Store the script path early. __file__ may be absent in Execute Python Script.
 try:
     _SCRIPT_PATH = os.path.abspath(__file__)
 except NameError:
@@ -32,28 +33,56 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
 
-import unreal
-
-# Discover script path if __file__ wasn't available
+# Execute Python Script does not consistently add the script directory to
+# sys.path. Resolve it before importing sibling bridge modules.
 if not _SCRIPT_PATH:
-    # Walk the call stack to find the path UEFN used to exec this script
     import inspect
     for fi in inspect.stack():
         if fi.filename and "server.py" in fi.filename and os.path.isfile(fi.filename):
             _SCRIPT_PATH = os.path.abspath(fi.filename)
             break
     if not _SCRIPT_PATH:
-        # Last resort: scan common locations
         for candidate in [
-            os.path.join(os.path.expanduser("~"), ".uefn-copilot", "uefn-python-bridge", "bridge", "server.py"),
+            os.path.join(
+                os.path.expanduser("~"),
+                ".uefn-copilot",
+                "uefn-python-bridge",
+                "bridge",
+                "server.py",
+            ),
         ]:
             if os.path.isfile(candidate):
                 _SCRIPT_PATH = candidate
                 break
+if _SCRIPT_PATH:
+    _BRIDGE_DIR = os.path.dirname(_SCRIPT_PATH)
+    if _BRIDGE_DIR not in sys.path:
+        sys.path.insert(0, _BRIDGE_DIR)
+
+import unreal
+
+try:
+    from .routes import (
+        TOOLSET_ROUTES,
+        UEFN_EXPOSED_TOOLSETS,
+        is_tool_allowed,
+        short_tool_name,
+    )
+    from .uefn_tool_policy import UEFN_TOOL_POLICY_REVISION
+except ImportError:
+    # Execute Python Script loads this file outside the bridge package.
+    from routes import (  # type: ignore
+        TOOLSET_ROUTES,
+        UEFN_EXPOSED_TOOLSETS,
+        is_tool_allowed,
+        short_tool_name,
+    )
+    from uefn_tool_policy import UEFN_TOOL_POLICY_REVISION  # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -61,10 +90,15 @@ PORT_RANGE_START = 9210
 PORT_RANGE_END = 9220
 WORKER_BATCH_SIZE = 8          # max commands per tick
 REQUEST_TIMEOUT_S = 30.0
+MCP_REQUEST_TIMEOUT_S = 120.0
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+DEFAULT_MCP_URL = os.environ.get(
+    "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
+)
 
 # ── Runtime state ──────────────────────────────────────────────────────────
 
@@ -74,11 +108,20 @@ _tick_handle: Optional[object] = None
 _active_port: int = 0
 
 _work_queue: queue.Queue = queue.Queue()
-_results: Dict[str, dict] = {}
+_results: Dict[str, Any] = {}
 _results_lock = threading.Lock()
+_pending_tool_calls: Dict[str, Any] = {}
+_abandoned_requests: set[str] = set()
 
 _log_lines: List[str] = []
 _history: List[dict] = []
+
+_mcp_url: str = DEFAULT_MCP_URL
+_mcp_client: Any = None
+_mcp_client_lock = threading.Lock()
+_toolset_schema_cache: Optional[List[dict]] = None
+_request_serial_lock = threading.Lock()
+_http_lifecycle_lock = threading.Lock()
 
 # ── Logging ────────────────────────────────────────────────────────────────
 
@@ -178,6 +221,538 @@ def run_command(name: str, params: dict) -> dict:
     return fn(**params)
 
 
+def _schedule_editor_callback(
+    callback: Callable[[], None],
+    delay_s: float = 0.2,
+) -> None:
+    """Run a callback on a later editor tick after an HTTP response can flush."""
+    earliest = time.monotonic() + delay_s
+    handle_box: Dict[str, Any] = {"fired": False}
+
+    def _deferred(_dt: float) -> None:
+        if handle_box["fired"] or time.monotonic() < earliest:
+            return
+        handle_box["fired"] = True
+        handle = handle_box.pop("handle", None)
+        if handle is not None:
+            try:
+                unreal.unregister_slate_post_tick_callback(handle)
+            except Exception:
+                pass
+        try:
+            callback()
+        except Exception as exc:
+            _log(f"Deferred editor callback failed: {exc}", "error")
+            _log(traceback.format_exc(), "error")
+
+    handle_box["handle"] = unreal.register_slate_post_tick_callback(_deferred)
+
+
+# -- Hybrid Toolset Registry / MCP routing ----------------------------------
+
+
+class _LocalRegistryUnavailable(RuntimeError):
+    """The embedded Toolset Registry cannot service a requested capability."""
+
+
+class _RegistryOutcomeUnknown(RuntimeError):
+    """A registry dispatch failed after execution may have started."""
+
+    outcome_unknown = True
+
+
+class _MCPFallback:
+    """Signal the HTTP worker to run an operation through upstream UEFN MCP."""
+
+    def __init__(
+        self,
+        operation: str,
+        *,
+        toolset_name: str = "",
+        tool_name: str = "",
+        arguments: Optional[dict] = None,
+        reason: str = "",
+    ) -> None:
+        self.operation = operation
+        self.toolset_name = toolset_name
+        self.tool_name = tool_name
+        self.arguments = arguments or {}
+        self.reason = reason
+        self.command = ""
+        self.started_mono = time.monotonic()
+
+
+class _PendingRegistryCall:
+    """A native tool invocation that must be polled on later editor ticks."""
+
+    def __init__(
+        self,
+        async_result: Any,
+        toolset_name: str,
+        tool_name: str,
+        arguments: dict,
+    ) -> None:
+        self.async_result = async_result
+        self.toolset_name = toolset_name
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.command = ""
+        self.started_mono = time.monotonic()
+        self.deadline_mono = 0.0
+
+    def poll(self) -> Optional[Any]:
+        """Return a response/fallback when complete, otherwise None."""
+        if self.deadline_mono and time.monotonic() >= self.deadline_mono:
+            return {
+                "ok": False,
+                "route": "toolset_registry",
+                "outcome_unknown": True,
+                "error": (
+                    f"Toolset call '{self.toolset_name}.{self.tool_name}' timed out. "
+                    "It was not retried through MCP because the local mutation may "
+                    "still complete."
+                ),
+            }
+
+        try:
+            is_complete = bool(self.async_result.is_complete)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "route": "toolset_registry",
+                "outcome_unknown": True,
+                "error": f"Could not poll Toolset Registry result: {exc}",
+            }
+        if not is_complete:
+            return None
+
+        try:
+            error = self.async_result.error
+        except Exception as exc:
+            return {
+                "ok": False,
+                "route": "toolset_registry",
+                "outcome_unknown": True,
+                "error": f"Could not read Toolset Registry error state: {exc}",
+            }
+        if error:
+            error_text = str(error)
+            return {
+                "ok": False,
+                "route": "toolset_registry",
+                "error": error_text,
+            }
+
+        try:
+            value = self.async_result.value
+            parsed = json.loads(value) if isinstance(value, str) else to_json_safe(value)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "route": "toolset_registry",
+                "outcome_unknown": True,
+                "error": (
+                    f"{self.toolset_name}.{self.tool_name} returned invalid JSON: {exc}"
+                ),
+            }
+        return {"ok": True, "route": "toolset_registry", "result": parsed}
+
+
+def _registry() -> Any:
+    registry = getattr(unreal, "ToolsetRegistry", None)
+    if registry is None:
+        raise _LocalRegistryUnavailable("unreal.ToolsetRegistry is not exposed")
+    try:
+        if not registry.is_available():
+            raise _LocalRegistryUnavailable("Toolset Registry is not available")
+    except AttributeError as exc:
+        raise _LocalRegistryUnavailable(
+            "Toolset Registry availability API is not exposed"
+        ) from exc
+    return registry
+
+
+def _parse_toolset_schemas(raw: Any) -> List[dict]:
+    """Normalize all observed registry schema container shapes."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Toolset Registry returned invalid schema JSON: {exc}") from exc
+
+    if isinstance(raw, dict):
+        if "name" in raw and "tools" in raw:
+            raw = [raw]
+        elif isinstance(raw.get("toolsets"), list):
+            raw = raw["toolsets"]
+        else:
+            raw = list(raw.values())
+    elif not isinstance(raw, (list, tuple)):
+        try:
+            raw = list(raw)
+        except TypeError as exc:
+            raise ValueError(
+                f"Unexpected Toolset Registry schema container: {type(raw).__name__}"
+            ) from exc
+
+    schemas: List[dict] = []
+    for item in raw:
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid toolset schema JSON: {exc}") from exc
+        if isinstance(item, dict) and item.get("name"):
+            schemas.append(item)
+    return schemas
+
+
+def _get_local_toolset_schemas(refresh: bool = False) -> List[dict]:
+    """Read and cache native schemas. Must be called on the editor thread."""
+    global _toolset_schema_cache
+    if _toolset_schema_cache is not None and not refresh:
+        return _toolset_schema_cache
+    registry = _registry()
+    getter = getattr(registry, "get_all_toolset_json_schemas", None)
+    if not callable(getter):
+        raise _LocalRegistryUnavailable(
+            "Toolset Registry schema discovery API is not exposed"
+        )
+    try:
+        discovered = _parse_toolset_schemas(getter())
+    except Exception as exc:
+        raise _LocalRegistryUnavailable(
+            f"Toolset Registry schema discovery failed safely: {exc}"
+        ) from exc
+    filtered: List[dict] = []
+    for item in discovered:
+        toolset_name = item.get("name")
+        if toolset_name not in UEFN_EXPOSED_TOOLSETS:
+            continue
+        tools = item.get("tools")
+        if not isinstance(tools, list):
+            raise _LocalRegistryUnavailable(
+                f"Toolset '{toolset_name}' returned a malformed tools schema"
+            )
+        visible = dict(item)
+        visible["tools"] = [
+            tool for tool in tools
+            if isinstance(tool, dict)
+            and is_tool_allowed(toolset_name, tool.get("name", ""))
+        ]
+        filtered.append(visible)
+    _toolset_schema_cache = filtered
+    return _toolset_schema_cache
+
+
+def _start_local_tool_call(
+    toolset_name: str,
+    tool_name: str,
+    arguments: Optional[dict] = None,
+    allow_mcp_fallback: bool = True,
+) -> Any:
+    """Start a native registry call without blocking the editor thread."""
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise TypeError("Tool arguments must be an object")
+    try:
+        encoded_arguments = json.dumps(arguments, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Tool arguments are not valid JSON: {exc}") from exc
+    tool_name = short_tool_name(toolset_name, tool_name)
+    try:
+        if tool_name is None or not is_tool_allowed(toolset_name, tool_name):
+            raise _LocalRegistryUnavailable(
+                f"Tool '{toolset_name}.{tool_name or '<invalid>'}' is not approved "
+                "for UEFN local routing"
+            )
+        schemas = _get_local_toolset_schemas()
+        described = next(
+            (item for item in schemas if item.get("name") == toolset_name),
+            None,
+        )
+        if described is None or not any(
+            short_tool_name(toolset_name, tool.get("name", "")) == tool_name
+            for tool in described.get("tools", [])
+            if isinstance(tool, dict)
+        ):
+            raise _LocalRegistryUnavailable(
+                f"Tool '{toolset_name}.{tool_name}' is not exposed by the "
+                "current UEFN Toolset Registry"
+            )
+        registry = _registry()
+        is_registered = getattr(registry, "is_toolset_registered", None)
+        if callable(is_registered) and not is_registered(toolset_name):
+            raise _LocalRegistryUnavailable(
+                f"Toolset '{toolset_name}' is not registered"
+            )
+    except _LocalRegistryUnavailable as exc:
+        if allow_mcp_fallback:
+            return _MCPFallback(
+                "call",
+                toolset_name=toolset_name,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=str(exc),
+            )
+        raise
+    except Exception as exc:
+        if allow_mcp_fallback:
+            return _MCPFallback(
+                "call",
+                toolset_name=toolset_name,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=str(exc),
+            )
+        raise
+
+    # execute_tool is the dispatch boundary. Nothing after this point may
+    # switch transports because a mutation may already have started.
+    try:
+        async_result = registry.execute_tool(
+            toolset_name, tool_name, encoded_arguments
+        )
+    except Exception as exc:
+        raise _RegistryOutcomeUnknown(
+            f"Toolset Registry dispatch for '{toolset_name}.{tool_name}' failed; "
+            "the operation was not retried because it may still complete: "
+            f"{exc}"
+        ) from exc
+    return _PendingRegistryCall(
+        async_result, toolset_name, tool_name, arguments
+    )
+
+
+@command("toolsets.list")
+def _cmd_toolsets_list(refresh: bool = False) -> Any:
+    """List native editor toolsets through the fast in-process registry."""
+    try:
+        schemas = _get_local_toolset_schemas(refresh=refresh)
+    except _LocalRegistryUnavailable as exc:
+        return _MCPFallback("list", reason=str(exc))
+    toolsets = [
+        {
+            "name": item.get("name", ""),
+            "version": item.get("version", ""),
+            "description": item.get("description", ""),
+            "tool_count": len(item.get("tools", [])),
+        }
+        for item in schemas
+    ]
+    return {"toolsets": toolsets, "count": len(toolsets)}
+
+
+@command("toolsets.describe")
+def _cmd_toolsets_describe(toolset_name: str, refresh: bool = False) -> Any:
+    """Return one native toolset's complete JSON schema."""
+    try:
+        schemas = _get_local_toolset_schemas(refresh=refresh)
+    except _LocalRegistryUnavailable as exc:
+        return _MCPFallback(
+            "describe", toolset_name=toolset_name, reason=str(exc)
+        )
+    for schema in schemas:
+        if schema.get("name") == toolset_name:
+            return schema
+    return _MCPFallback(
+        "describe",
+        toolset_name=toolset_name,
+        reason=f"Toolset '{toolset_name}' is not registered locally",
+    )
+
+
+@command("toolsets.call")
+def _cmd_toolsets_call(
+    toolset_name: str,
+    tool_name: str,
+    arguments: Optional[dict] = None,
+    allow_mcp_fallback: bool = True,
+) -> Any:
+    """Call a tool locally, falling back to UEFN MCP only if unavailable."""
+    return _start_local_tool_call(
+        toolset_name,
+        tool_name,
+        arguments,
+        allow_mcp_fallback=allow_mcp_fallback,
+    )
+
+
+def _make_toolset_route(toolset_name: str, tool_name: str) -> Callable:
+    def _route(allow_mcp_fallback: bool = True, **arguments: Any) -> Any:
+        return _start_local_tool_call(
+            toolset_name,
+            tool_name,
+            arguments,
+            allow_mcp_fallback=allow_mcp_fallback,
+        )
+
+    _route.__name__ = f"_route_{tool_name}"
+    _route.__doc__ = (
+        f"Hybrid alias for {toolset_name}.{tool_name}. "
+        "Uses the local registry before MCP."
+    )
+    return _route
+
+
+for _alias, (_toolset_name, _tool_name) in TOOLSET_ROUTES.items():
+    if _alias in _commands:
+        raise RuntimeError(f"Hybrid route collides with command '{_alias}'")
+    command(_alias)(_make_toolset_route(_toolset_name, _tool_name))
+
+
+def _mcp_client_type() -> Any:
+    try:
+        from .mcp_client import UnrealMCPClient
+    except ImportError:
+        from mcp_client import UnrealMCPClient
+    return UnrealMCPClient
+
+
+def _get_mcp_client() -> Any:
+    global _mcp_client
+    with _mcp_client_lock:
+        if _mcp_client is None:
+            _mcp_client = _mcp_client_type()(
+                endpoint=_mcp_url,
+                timeout=MCP_REQUEST_TIMEOUT_S,
+            )
+        return _mcp_client
+
+
+def _close_mcp_client_quietly(client: Any) -> None:
+    try:
+        client.close(timeout=3.0)
+    except Exception:
+        pass
+
+
+def _close_mcp_client_serialized_quietly(client: Any) -> None:
+    """Serialize shutdown DELETE with every upstream MCP request."""
+    with _request_serial_lock:
+        _close_mcp_client_quietly(client)
+
+
+def _reset_mcp_client(url: str = "", close_async: bool = False) -> None:
+    global _mcp_client, _mcp_url
+    candidate = None
+    if url:
+        # Validate before changing the live client or endpoint.
+        candidate = _mcp_client_type()(
+            endpoint=url,
+            timeout=MCP_REQUEST_TIMEOUT_S,
+        )
+    with _mcp_client_lock:
+        previous = _mcp_client
+        _mcp_client = candidate
+        if candidate is not None:
+            _mcp_url = candidate.endpoint
+    if previous is not None:
+        if close_async:
+            threading.Thread(
+                target=_close_mcp_client_serialized_quietly,
+                args=(previous,),
+                daemon=True,
+            ).start()
+        else:
+            _close_mcp_client_quietly(previous)
+
+
+def _execute_mcp_fallback(
+    fallback: _MCPFallback,
+    timeout_s: float = MCP_REQUEST_TIMEOUT_S,
+) -> dict:
+    """Run an upstream MCP request from the bridge HTTP worker thread."""
+    try:
+        client = _get_mcp_client()
+        if fallback.operation == "list":
+            result = client.list_toolsets(timeout=timeout_s)
+        elif fallback.operation == "describe":
+            result = client.describe_toolset(
+                fallback.toolset_name, timeout=timeout_s
+            )
+        elif fallback.operation == "call":
+            result = client.call_tool(
+                fallback.toolset_name,
+                fallback.tool_name,
+                fallback.arguments,
+                timeout=timeout_s,
+            )
+        else:
+            raise ValueError(f"Unknown MCP fallback operation '{fallback.operation}'")
+        response = {"ok": True, "route": "mcp", "result": result}
+        if fallback.reason:
+            response["fallback_reason"] = fallback.reason
+        return response
+    except Exception as exc:
+        response = {
+            "ok": False,
+            "route": "mcp",
+            "error": f"UEFN MCP fallback failed: {exc}",
+        }
+        if getattr(exc, "outcome_unknown", False):
+            response["outcome_unknown"] = True
+        if fallback.reason:
+            response["fallback_reason"] = fallback.reason
+        return response
+
+
+@command("mcp.status")
+def _cmd_mcp_status(_timeout_s: float = MCP_REQUEST_TIMEOUT_S) -> dict:
+    """Initialize the upstream MCP session and report its negotiated state."""
+    client = _get_mcp_client()
+    result = client.initialize(timeout=_timeout_s)
+    return {"endpoint": client.endpoint, "server": result}
+
+
+@command("mcp.list_toolsets")
+def _cmd_mcp_list_toolsets(
+    refresh: bool = False,
+    _timeout_s: float = MCP_REQUEST_TIMEOUT_S,
+) -> Any:
+    return _get_mcp_client().list_toolsets(
+        refresh=refresh, timeout=_timeout_s
+    )
+
+
+@command("mcp.describe_toolset")
+def _cmd_mcp_describe_toolset(
+    toolset_name: str,
+    refresh: bool = False,
+    _timeout_s: float = MCP_REQUEST_TIMEOUT_S,
+) -> Any:
+    return _get_mcp_client().describe_toolset(
+        toolset_name, refresh=refresh, timeout=_timeout_s
+    )
+
+
+@command("mcp.call")
+def _cmd_mcp_call(
+    toolset_name: str,
+    tool_name: str,
+    arguments: Optional[dict] = None,
+    _timeout_s: float = MCP_REQUEST_TIMEOUT_S,
+) -> Any:
+    return _get_mcp_client().call_tool(
+        toolset_name, tool_name, arguments, timeout=_timeout_s
+    )
+
+
+@command("mcp.configure")
+def _cmd_mcp_configure(url: str) -> dict:
+    """Set a loopback UEFN MCP endpoint and clear the current session."""
+    _reset_mcp_client(url)
+    return {"endpoint": _mcp_url}
+
+
+@command("mcp.reset")
+def _cmd_mcp_reset() -> dict:
+    """Discard the upstream MCP session so the next call reinitializes it."""
+    _reset_mcp_client()
+    return {"endpoint": _mcp_url, "reset": True}
+
+
 # ── Built-in commands ──────────────────────────────────────────────────────
 # Each command returns a plain dict; the bridge JSON-encodes it for the caller.
 
@@ -190,6 +765,12 @@ def _cmd_status() -> dict:
         "port": _active_port,
         "uptime_s": round(time.monotonic() - _start_mono, 1) if _start_mono else 0,
         "commands": sorted(_commands),
+        "routing": {
+            "strategy": ["python", "toolset_registry", "mcp"],
+            "toolset_aliases": sorted(TOOLSET_ROUTES),
+            "tool_policy_revision": UEFN_TOOL_POLICY_REVISION,
+            "mcp_endpoint": _mcp_url,
+        },
     }
 
 
@@ -248,30 +829,25 @@ def _cmd_history(tail: int = 30) -> dict:
 @command("shutdown")
 def _cmd_shutdown() -> dict:
     """Stop the bridge server.  Re-run the py command to start again."""
-    import threading
-    def _do_stop():
-        time.sleep(0.2)  # let the response flush
-        stop()
-    threading.Thread(target=_do_stop, daemon=True).start()
+    _schedule_editor_callback(stop)
     return {"message": "Shutting down..."}
 
 
 @command("reload")
 def _cmd_reload() -> dict:
     """Stop the server, re-read the script from disk, and restart."""
-    import threading
     script_path = _SCRIPT_PATH
     if not script_path or not os.path.isfile(script_path):
         return {"error": f"Cannot find script path (got: {script_path!r}). Restart manually."}
+
     def _do_reload():
-        time.sleep(0.2)  # let the response flush
         stop()
-        time.sleep(0.3)
         _log("Reloading from disk...")
         with open(script_path, "r") as f:
             code = f.read()
         exec(code, {"__file__": script_path, "__name__": "__reloaded__", "__builtins__": __builtins__})
-    threading.Thread(target=_do_reload, daemon=True).start()
+
+    _schedule_editor_callback(_do_reload)
     return {"message": f"Reloading from {script_path}..."}
 
 
@@ -891,6 +1467,20 @@ def _cmd_batch_exec(commands: List[dict], transaction: str = "") -> dict:
             name = item.get("command", "")
             params = item.get("params", {})
             params.pop("transaction", None)  # avoid nested transactions
+            if (
+                name.startswith("mcp.")
+                or name.startswith("toolsets.")
+                or name in TOOLSET_ROUTES
+            ):
+                results.append({
+                    "index": i,
+                    "success": False,
+                    "error": (
+                        f"'{name}' is asynchronous and cannot run inside "
+                        "batch.exec. Call it separately."
+                    ),
+                })
+                continue
             try:
                 r = run_command(name, params)
                 results.append({"index": i, "success": True, "result": r})
@@ -921,7 +1511,7 @@ def _cmd_redo() -> dict:
 
 @command("fix_throttle")
 def _cmd_fix_throttle() -> dict:
-    """Disable 'Use Less CPU when in Background' — callable at any time."""
+    """Disable 'Use Less CPU when in Background'; callable at any time."""
     _disable_background_throttle()
     return {"success": True}
 
@@ -1014,6 +1604,12 @@ class _Handler(BaseHTTPRequestHandler):
     """Minimal REST handler.  GET / for health; POST / to run commands."""
 
     def do_GET(self) -> None:
+        if not self._origin_is_allowed():
+            self._respond(403, json.dumps({
+                "ok": False,
+                "error": "Cross-origin requests must originate from loopback",
+            }).encode())
+            return
         body = json.dumps({
             "bridge": "uefn-python-bridge",
             "version": VERSION,
@@ -1023,11 +1619,67 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(200, body)
 
     def do_POST(self) -> None:
+        # ThreadingHTTPServer lets shutdown proceed while a handler is slow.
+        # Do not hold a process-global lock while reading an untrusted body.
+        # Actual editor work and MCP network dispatch are serialized later.
+        if not self._server_accepts_dispatch():
+            self._respond_stopping()
+            return
+        self._handle_post()
+
+    def _handle_post(self) -> None:
+        if not self._origin_is_allowed():
+            self._respond(403, json.dumps({
+                "ok": False,
+                "error": "Cross-origin requests must originate from loopback",
+            }).encode())
+            return
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._respond(415, json.dumps({
+                "ok": False,
+                "error": "Content-Type must be application/json",
+            }).encode())
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "Transfer-Encoding is not supported",
+            }).encode())
+            return
         try:
-            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._respond(411, json.dumps({
+                "ok": False,
+                "error": "A valid Content-Length header is required",
+            }).encode())
+            return
+        if content_length < 1:
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "Request body must not be empty",
+            }).encode())
+            return
+        if content_length > MAX_REQUEST_BYTES:
+            self._respond(413, json.dumps({
+                "ok": False,
+                "error": f"Request body exceeds {MAX_REQUEST_BYTES} bytes",
+            }).encode())
+            return
+        try:
+            raw = self.rfile.read(content_length)
             payload = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             self._respond(400, json.dumps({"ok": False, "error": f"Bad JSON: {exc}"}).encode())
+            return
+
+        if not isinstance(payload, dict):
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "Request JSON must be an object",
+            }).encode())
             return
 
         cmd = payload.get("command", "")
@@ -1037,52 +1689,184 @@ class _Handler(BaseHTTPRequestHandler):
             max(1.0, min(600.0, float(timeout_s)))
             if isinstance(timeout_s, (int, float)) else REQUEST_TIMEOUT_S
         )
-        if not cmd:
-            self._respond(400, json.dumps({"ok": False, "error": "Missing 'command'"}).encode())
+        if not isinstance(cmd, str) or not cmd:
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "'command' must be a non-empty string",
+            }).encode())
+            return
+        if not isinstance(params, dict):
+            self._respond(400, json.dumps({"ok": False, "error": "'params' must be an object"}).encode())
             return
 
         rid = uuid.uuid4().hex
+        deadline = time.monotonic() + request_timeout_s
 
-        # Thread-safe commands can always run directly on the HTTP thread
-        if cmd in _THREAD_SAFE_COMMANDS:
-            resp = _execute_and_respond(rid, cmd, params)
+        # Pure status data can remain responsive while an editor tool is active.
+        if cmd in _UNSERIALIZED_HTTP_COMMANDS:
+            if not self._reserve_dispatch():
+                self._respond_stopping()
+                return
+            resp = _execute_and_respond(rid, cmd, dict(params))
             self._respond(200, json.dumps(resp).encode())
             return
 
-        # Unreal-API commands must run on the main (game) thread via tick queue
-        _work_queue.put((rid, cmd, params))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not _request_serial_lock.acquire(timeout=remaining):
+            self._respond(200, json.dumps({
+                "ok": False,
+                "route": _command_route(cmd),
+                "error": f"'{cmd}' expired before serialized dispatch",
+            }).encode())
+            return
+        try:
+            if not self._reserve_dispatch():
+                status, resp = 503, {
+                    "ok": False,
+                    "error": "Bridge server is stopping",
+                }
+            else:
+                status, resp = self._dispatch_serialized(
+                    rid, cmd, params, deadline, request_timeout_s
+                )
+        finally:
+            _request_serial_lock.release()
+        try:
+            self._respond(status, json.dumps(resp).encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-        # If tick callback isn't processing, nudge with a one-shot callback
-        if _dispatch_mode == "direct":
-            try:
-                def _oneshot(dt):
-                    _tick(dt)
-                    try:
-                        unreal.unregister_slate_post_tick_callback(_oneshot)
-                    except Exception:
-                        pass
-                unreal.register_slate_post_tick_callback(_oneshot)
-            except Exception:
-                pass  # fall through to poll loop either way
+    def _dispatch_serialized(
+        self,
+        rid: str,
+        cmd: str,
+        params: dict,
+        deadline: float,
+        request_timeout_s: float,
+    ) -> tuple[int, dict]:
+        """Run one editor or MCP command while the global dispatch lock is held."""
+        if cmd in _HTTP_THREAD_COMMANDS:
+            direct_params = dict(params)
+            if cmd in _MCP_NETWORK_COMMANDS:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return 200, {
+                        "ok": False,
+                        "route": "mcp",
+                        "error": f"'{cmd}' expired before MCP dispatch",
+                    }
+                direct_params.setdefault("_timeout_s", remaining)
+            resp = _execute_and_respond(rid, cmd, direct_params)
+            if isinstance(resp, (_MCPFallback, _PendingRegistryCall)):
+                resp = {
+                    "ok": False,
+                    "route": "python",
+                    "error": f"'{cmd}' returned an invalid deferred result",
+                }
+            return 200, resp
 
-        deadline = time.monotonic() + request_timeout_s
-        throttle_retry = False
+        # Unreal-API commands run on the main (game) thread via the tick queue.
+        if not self._enqueue_if_active((rid, cmd, params, deadline)):
+            return 503, {
+                "ok": False,
+                "error": "Bridge server is stopping",
+            }
+
         while time.monotonic() < deadline:
+            completed = None
             with _results_lock:
                 if rid in _results:
-                    resp = _results.pop(rid)
-                    self._respond(200, json.dumps(resp).encode())
-                    return
-            # If we've waited more than half the timeout, try re-disabling
-            # background throttle in case user re-enabled it
-            if not throttle_retry and (time.monotonic() - deadline + request_timeout_s) > request_timeout_s * 0.5:
-                throttle_retry = True
-                _disable_background_throttle()
+                    completed = _results.pop(rid)
+            if completed is not None:
+                if isinstance(completed, _MCPFallback):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        resp = {
+                            "ok": False,
+                            "route": "toolset_registry",
+                            "error": (
+                                f"'{completed.command or cmd}' exhausted its "
+                                "deadline before MCP fallback dispatch"
+                            ),
+                        }
+                    else:
+                        if not self._reserve_dispatch():
+                            resp = {
+                                "ok": False,
+                                "route": "mcp",
+                                "error": "Bridge server stopped before MCP dispatch",
+                            }
+                        else:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                resp = {
+                                    "ok": False,
+                                    "route": "mcp",
+                                    "error": (
+                                        f"'{completed.command or cmd}' exhausted "
+                                        "its deadline before MCP dispatch"
+                                    ),
+                                }
+                            else:
+                                resp = _execute_mcp_fallback(
+                                    completed,
+                                    timeout_s=remaining,
+                                )
+                    _record_history(
+                        completed.command or cmd,
+                        completed.started_mono,
+                        resp,
+                    )
+                else:
+                    resp = completed
+                return 200, resp
             time.sleep(POLL_SLEEP_S)
-        self._respond(504, json.dumps({"ok": False, "error": f"'{cmd}' timed out ({request_timeout_s}s). Unreal API calls require the editor main thread; ensure UEFN is focused."}).encode())
+        with _results_lock:
+            _abandoned_requests.add(rid)
+            _results.pop(rid, None)
+        return 504, {
+            "ok": False,
+            "route": _command_route(cmd),
+            "outcome_unknown": True,
+            "error": (
+                f"'{cmd}' timed out ({request_timeout_s}s). The operation may "
+                "still complete if it had already started; it was not retried."
+            ),
+        }
+
+    def _server_accepts_dispatch(self) -> bool:
+        return (
+            self.server is _http
+            and bool(getattr(self.server, "_uefn_bridge_accepting", False))
+        )
+
+    def _reserve_dispatch(self) -> bool:
+        """Commit a worker-thread command before stop marks this server stale."""
+        with _http_lifecycle_lock:
+            return self._server_accepts_dispatch()
+
+    def _enqueue_if_active(self, item: tuple) -> bool:
+        """Atomically validate this server generation and publish editor work."""
+        with _http_lifecycle_lock:
+            if not self._server_accepts_dispatch():
+                return False
+            _work_queue.put(item)
+            return True
+
+    def _respond_stopping(self) -> None:
+        self._respond(503, json.dumps({
+            "ok": False,
+            "error": "Bridge server is stopping",
+        }).encode())
 
     # Allow cross-origin for web-based tools
     def do_OPTIONS(self) -> None:
+        if not self._origin_is_allowed():
+            self._respond(403, json.dumps({
+                "ok": False,
+                "error": "Cross-origin requests must originate from loopback",
+            }).encode())
+            return
         self.send_response(204)
         self._cors_headers()
         self.end_headers()
@@ -1096,9 +1880,27 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "127.0.0.1")
+        origin = self.headers.get("Origin")
+        if origin and self._origin_is_allowed():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _origin_is_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                return False
+            host = parsed.hostname.rstrip(".").lower()
+            if host == "localhost":
+                return True
+            return ipaddress.ip_address(host).is_loopback
+        except (TypeError, ValueError):
+            return False
 
     def log_message(self, *_: Any) -> None:
         pass  # silence default stderr spam
@@ -1107,43 +1909,177 @@ class _Handler(BaseHTTPRequestHandler):
 # ── Command execution ──────────────────────────────────────────────────────
 
 _start_mono: float = 0
-_dispatch_mode: str = "direct"  # "tick" or "direct"
+_dispatch_mode: str = "tick"
 _tick_health: int = 0           # incremented by tick callback
 
-# Commands that are safe to run from any thread (no Unreal subsystem calls)
-_THREAD_SAFE_COMMANDS = frozenset({"status", "log", "history", "shutdown", "reload", "fix_throttle", "store.install"})
+# Commands that are safe on the HTTP worker because they make no unreal calls.
+_HTTP_THREAD_COMMANDS = frozenset({
+    "status",
+    "log",
+    "history",
+    "mcp.status",
+    "mcp.list_toolsets",
+    "mcp.describe_toolset",
+    "mcp.call",
+    "mcp.configure",
+    "mcp.reset",
+})
+_MCP_NETWORK_COMMANDS = frozenset({
+    "mcp.status",
+    "mcp.list_toolsets",
+    "mcp.describe_toolset",
+    "mcp.call",
+})
+_UNSERIALIZED_HTTP_COMMANDS = frozenset({
+    "status",
+    "log",
+    "history",
+})
 
 
-def _execute_and_respond(rid: str, cmd: str, params: dict) -> dict:
+def _command_route(cmd: str) -> str:
+    if cmd.startswith("mcp."):
+        return "mcp"
+    if cmd.startswith("toolsets.") or cmd in TOOLSET_ROUTES:
+        return "toolset_registry"
+    return "python"
+
+
+def _record_history(cmd: str, started_mono: float, resp: dict) -> None:
+    elapsed_ms = round((time.monotonic() - started_mono) * 1000, 1)
+    entry = {
+        "command": cmd,
+        "route": resp.get("route", _command_route(cmd)),
+        "elapsed_ms": elapsed_ms,
+        "ok": resp.get("ok", False),
+    }
+    if resp.get("fallback_reason"):
+        entry["fallback_reason"] = resp["fallback_reason"]
+    _history.append(entry)
+    while len(_history) > HISTORY_CAP:
+        _history.pop(0)
+
+
+def _execute_and_respond(rid: str, cmd: str, params: dict) -> Any:
     """Execute a command and return the response dict.  Thread-safe logging."""
     t0 = time.monotonic()
     try:
         data = run_command(cmd, params)
-        resp = {"ok": True, "result": data}
+        if isinstance(data, (_PendingRegistryCall, _MCPFallback)):
+            data.command = cmd
+            data.started_mono = t0
+            return data
+        resp = {"ok": True, "route": _command_route(cmd), "result": data}
     except Exception as exc:
         _log(f"Command '{cmd}' failed: {exc}", "error")
-        resp = {"ok": False, "error": str(exc), "traceback": traceback.format_exc()}
-    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-    _history.append({"command": cmd, "elapsed_ms": elapsed_ms, "ok": resp.get("ok", False)})
-    while len(_history) > HISTORY_CAP:
-        _history.pop(0)
+        resp = {
+            "ok": False,
+            "route": _command_route(cmd),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        if getattr(exc, "outcome_unknown", False):
+            resp["outcome_unknown"] = True
+    _record_history(cmd, t0, resp)
     return resp
+
+
+def _publish_result(rid: str, result: Any) -> None:
+    """Publish a response unless its HTTP caller has already timed out."""
+    with _results_lock:
+        if rid in _abandoned_requests:
+            _abandoned_requests.remove(rid)
+            return
+        _results[rid] = result
+
+
+def _poll_pending_tool_calls() -> None:
+    for rid, pending in list(_pending_tool_calls.items()):
+        outcome = pending.poll()
+        if outcome is None:
+            continue
+        del _pending_tool_calls[rid]
+        if isinstance(outcome, _MCPFallback):
+            outcome.command = pending.command
+            outcome.started_mono = pending.started_mono
+        else:
+            _record_history(pending.command, pending.started_mono, outcome)
+        _publish_result(rid, outcome)
+
+
+def _cancel_dispatch_state() -> None:
+    """Cancel work that must not survive a bridge stop/restart."""
+    global _tick_health
+    cancellations: Dict[str, dict] = {}
+    while True:
+        try:
+            rid, cmd, _params, _deadline = _work_queue.get_nowait()
+        except queue.Empty:
+            break
+        cancellations[rid] = {
+            "ok": False,
+            "route": _command_route(cmd),
+            "error": f"'{cmd}' was cancelled before editor dispatch",
+        }
+
+    for rid, pending in list(_pending_tool_calls.items()):
+        cancellations[rid] = {
+            "ok": False,
+            "route": "toolset_registry",
+            "outcome_unknown": True,
+            "error": (
+                f"'{pending.command}' was pending when the bridge stopped; "
+                "the operation may still complete and was not retried"
+            ),
+        }
+    _pending_tool_calls.clear()
+    _tick_health = 0
+
+    with _results_lock:
+        for rid, response in cancellations.items():
+            if rid in _abandoned_requests:
+                _abandoned_requests.remove(rid)
+            else:
+                _results[rid] = response
 
 
 def _tick(dt: float) -> None:
     """Drain the work queue on the editor's main thread (if tick dispatch is active)."""
     global _tick_health
     _tick_health += 1
+    _poll_pending_tool_calls()
+    if _pending_tool_calls:
+        return
     done = 0
     while not _work_queue.empty() and done < WORKER_BATCH_SIZE:
         try:
-            rid, cmd, params = _work_queue.get_nowait()
+            rid, cmd, params, deadline = _work_queue.get_nowait()
         except queue.Empty:
             break
-        resp = _execute_and_respond(rid, cmd, params)
         with _results_lock:
-            _results[rid] = resp
+            if rid in _abandoned_requests:
+                _abandoned_requests.remove(rid)
+                done += 1
+                continue
+        if time.monotonic() >= deadline:
+            _publish_result(rid, {
+                "ok": False,
+                "route": _command_route(cmd),
+                "error": f"'{cmd}' expired before it reached the editor thread",
+            })
+            done += 1
+            continue
+        response = _execute_and_respond(rid, cmd, params)
+        if isinstance(response, _PendingRegistryCall):
+            response.deadline_mono = deadline
+            _pending_tool_calls[rid] = response
+            done += 1
+            break
+        else:
+            _publish_result(rid, response)
         done += 1
+    # Some registry tools complete synchronously. Pick those up this tick.
+    _poll_pending_tool_calls()
 
 
 # ── Start / Stop ───────────────────────────────────────────────────────────
@@ -1169,7 +2105,7 @@ def _pick_port() -> int:
             return port
         except OSError:
             continue
-    raise RuntimeError(f"No free port in {PORT_RANGE_START}–{PORT_RANGE_END}")
+    raise RuntimeError(f"No free port in {PORT_RANGE_START}-{PORT_RANGE_END}")
 
 
 def _disable_background_throttle() -> None:
@@ -1198,7 +2134,7 @@ def _disable_background_throttle() -> None:
         except Exception:
             pass
 
-    # Method 3: Console command — try various world context approaches
+    # Method 3: Console command with available world context approaches
     if not success:
         for world_ctx in [None]:
             try:
@@ -1211,7 +2147,7 @@ def _disable_background_throttle() -> None:
             except Exception:
                 pass
 
-    # Method 4: Keep-alive ticker — if we can't disable throttle,
+    # Method 4: Keep-alive ticker if we cannot disable throttle.
     # ensure ticks fire by periodically requesting focus
     if not success:
         _log("WARNING: Could not disable background CPU throttle. "
@@ -1219,14 +2155,32 @@ def _disable_background_throttle() -> None:
              "Performance → 'Use Less CPU when in Background'")
 
 
+def _unregister_tick_callback() -> None:
+    """Forget and best-effort unregister the current Slate callback."""
+    global _tick_handle
+    handle = _tick_handle
+    _tick_handle = None
+    if handle is None:
+        return
+    try:
+        unreal.unregister_slate_post_tick_callback(handle)
+    except Exception as exc:
+        _log(f"Tick callback cleanup failed: {exc}", "warn")
+
+
 def start(port: int = 0, mode: str = "auto") -> int:
     """Start the bridge.  Returns the bound port.
 
     Args:
         port: Port to bind (0 = auto-detect).
-        mode: Dispatch mode — "auto" (detect best), "direct", or "tick".
+        mode: Deprecated compatibility parameter. Editor work always uses a
+            Slate tick callback so Unreal APIs stay on the game thread.
     """
-    global _http, _http_thread, _tick_handle, _active_port, _start_mono, _dispatch_mode
+    global _http, _http_thread, _tick_handle, _active_port, _start_mono
+    global _dispatch_mode, _toolset_schema_cache
+
+    if mode not in ("auto", "direct", "tick"):
+        raise ValueError("mode must be 'auto', 'direct', or 'tick'")
 
     if _http is not None:
         # Check if previous server is actually alive
@@ -1234,26 +2188,56 @@ def start(port: int = 0, mode: str = "auto") -> int:
             _log(f"Already running on :{_active_port}", "warn")
             return _active_port
         else:
-            _log("Previous server died — cleaning up and restarting")
+            _log("Previous server died; cleaning up and restarting")
+            with _http_lifecycle_lock:
+                _http._uefn_bridge_accepting = False
+                _cancel_dispatch_state()
+            _unregister_tick_callback()
             try:
                 _http.server_close()
             except Exception:
                 pass
             _http = None
+            _http_thread = None
+            _active_port = 0
+            _toolset_schema_cache = None
 
     _disable_background_throttle()
 
     port = port or _pick_port()
     # Override allow_reuse_address to prevent ghost binds
     HTTPServer.allow_reuse_address = False
-    _http = HTTPServer(("127.0.0.1", port), _Handler)
+    http_server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    http_server.daemon_threads = True
+    http_server._uefn_bridge_accepting = True
+    _http = http_server
     _active_port = port
     _start_mono = time.monotonic()
 
-    def _serve():
+    # The tick callback is mandatory. A listening server without it would
+    # accept editor commands that can only time out in the queue.
+    try:
+        _tick_handle = unreal.register_slate_post_tick_callback(_tick)
+    except Exception as exc:
+        http_server._uefn_bridge_accepting = False
+        http_server.server_close()
+        _http = None
+        _http_thread = None
+        _tick_handle = None
+        _active_port = 0
+        _start_mono = 0.0
+        _log(f"Tick callback registration failed: {exc}", "error")
+        raise RuntimeError(
+            "Cannot start bridge without a Slate tick callback"
+        ) from exc
+    _dispatch_mode = "tick"
+    if mode == "direct":
+        _log("Dispatch mode 'direct' is deprecated; using safe tick dispatch", "warn")
+
+    def _serve(server_instance: ThreadingHTTPServer = http_server):
         try:
             _log("HTTP server thread started")
-            _http.serve_forever()
+            server_instance.serve_forever(poll_interval=0.05)
             _log("HTTP server thread exited normally")
         except Exception as exc:
             _log(f"HTTP server crashed: {exc}", "error")
@@ -1262,36 +2246,7 @@ def start(port: int = 0, mode: str = "auto") -> int:
 
     _http_thread = threading.Thread(target=_serve, daemon=True)
     _http_thread.start()
-
-    # Register tick callback (useful even in direct mode for background tasks)
-    try:
-        _tick_handle = unreal.register_slate_post_tick_callback(_tick)
-    except Exception as exc:
-        _log(f"Tick callback registration failed: {exc}", "warn")
-        _tick_handle = None
-
-    # Auto-detect dispatch mode
-    if mode == "auto":
-        # Start in direct mode, but keep checking for ticks in background.
-        # During editor startup, ticks often don't fire yet.
-        _dispatch_mode = "direct"
-        _log("Dispatch: starting in direct mode, will upgrade to tick mode when available")
-
-        def _tick_upgrader():
-            """Background thread that upgrades to tick dispatch once Slate ticks are detected."""
-            global _dispatch_mode
-            for attempt in range(30):  # Check for up to ~30 seconds
-                time.sleep(1.0)
-                if _tick_health > 0:
-                    _dispatch_mode = "tick"
-                    _log("Dispatch: upgraded to tick mode (Slate ticks detected)")
-                    return
-            _log("Dispatch: staying in direct mode (no Slate ticks after 30s)")
-
-        threading.Thread(target=_tick_upgrader, daemon=True).start()
-    else:
-        _dispatch_mode = mode
-        _log(f"Dispatch: {mode} (manual)")
+    _log("Dispatch: tick (game thread)")
 
     _log(f"Bridge v{VERSION} listening on http://127.0.0.1:{port}")
     _log(f"{len(_commands)} commands registered")
@@ -1300,24 +2255,36 @@ def start(port: int = 0, mode: str = "auto") -> int:
 
 def stop() -> None:
     """Shut the bridge down cleanly."""
-    global _http, _http_thread, _tick_handle, _active_port
+    global _http, _http_thread, _tick_handle, _active_port, _toolset_schema_cache
 
     if _http is None:
+        _unregister_tick_callback()
+        _cancel_dispatch_state()
+        _toolset_schema_cache = None
+        _reset_mcp_client(close_async=True)
         _log("Not running", "warn")
         return
 
-    if _tick_handle:
-        unreal.unregister_slate_post_tick_callback(_tick_handle)
-        _tick_handle = None
-
-    _http.shutdown()
-    if _http_thread:
-        _http_thread.join(timeout=3)
+    # Mark this server generation stale and drain its editor queue atomically.
+    # A handler still reading a request body must not enqueue after this point.
+    with _http_lifecycle_lock:
+        _http._uefn_bridge_accepting = False
+        _cancel_dispatch_state()
+    _unregister_tick_callback()
+    if _http_thread and _http_thread.is_alive():
+        _http.shutdown()
+    _http.server_close()
+    if _http_thread and _http_thread.is_alive():
+        _http_thread.join(timeout=1)
 
     _log(f"Stopped (was :{_active_port})")
     _http = None
     _http_thread = None
     _active_port = 0
+    _toolset_schema_cache = None
+    # Waiting handlers consume cancellation results. Late editor results use
+    # abandoned-request markers, so neither collection is cleared here.
+    _reset_mcp_client(close_async=True)
 
 
 def restart(port: int = 0) -> int:
@@ -1328,8 +2295,5 @@ def restart(port: int = 0) -> int:
 
 # ── Auto-start when executed directly ──────────────────────────────────────
 
-if __name__ != "__reloaded__":
-    start()
-else:
-    # Reload path — re-register commands already defined above, then start
+if os.environ.get("UEFN_BRIDGE_NO_AUTOSTART") != "1":
     start()

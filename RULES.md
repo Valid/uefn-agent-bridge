@@ -1,7 +1,8 @@
-# UEFN Python Bridge — LLM Rules File
+# UEFN Hybrid Python Bridge - LLM Rules File
 
 > Drop this file into your AI tool's context to generate working UEFN Python
-> scripts.  Works with any LLM — Claude, GPT, Gemini, Llama, etc.
+> scripts and safe hybrid tool calls. Works with any LLM, including Claude,
+> GPT, Gemini, and Llama.
 >
 > For Cursor: copy to `.cursorrules`
 > For Claude Code: copy to `CLAUDE.md`
@@ -12,20 +13,67 @@
 ## What This Is
 
 UEFN (Unreal Editor for Fortnite) embeds Python 3.11 for **editor automation**.
-Python controls the editor — placing actors, managing assets, creating materials,
+Python controls the editor: placing actors, managing assets, creating materials,
 batch processing, pipeline tooling.  **Gameplay logic uses Verse, not Python.**
 
-The **UEFN Python Bridge** runs an HTTP server inside the editor so external
-tools can send commands.  But you can also write scripts that run directly
+The **UEFN Hybrid Python Bridge** runs an HTTP server inside the editor so
+external tools can send commands. You can also write scripts that run directly
 inside UEFN via `Tools > Execute Python Script`.
+
+The bridge uses this route order:
+
+1. Existing named bridge commands use direct embedded Python.
+2. UEFN-specific aliases and generic `toolsets.*` calls use Epic's in-process
+   Toolset Registry.
+3. The official loopback UEFN MCP server is used only when the local capability
+   or registry is proven unavailable before execution.
+
+All access is programmatic. Never use browser, desktop, clipboard UI, or other
+computer-control automation as a substitute for the bridge. The internal
+clipboard helpers documented below are programmatic Unreal editor operations,
+not UI automation.
+
+### Hybrid routing rules
+
+- Prefer a named direct Python command whenever it covers the task.
+- Prefer a friendly UEFN alias when Python cannot cover the task.
+- Use `toolsets.describe` before an unfamiliar generic tool call, then call the
+  exact toolset and tool names with `toolsets.call`.
+- Use `mcp.*` only to force or diagnose the official MCP transport. Do not use
+  forced MCP for a capability already covered by Python or the local registry.
+- Inspect the response `route`: `python`, `toolset_registry`, or `mcp`.
+- If a failure contains `"outcome_unknown": true`, stop. Inspect current editor
+  state before deciding whether another mutation is necessary.
+- Never replay a file write, build, session control, entity mutation, device
+  mutation, or event binding after a timeout, disconnect, or malformed result.
+- Do not place aliases, `toolsets.*`, or `mcp.*` calls inside `batch.exec`.
+- Do not overlap Toolset Registry or MCP calls. MCP serializes upstream HTTP
+  requests, and registry dispatch runs on UEFN's main editor thread.
 
 ## Environment
 
-- Python **3.11** (embedded in UEFN — no pip, no venv, stdlib only)
+- Python **3.11** (embedded in UEFN, no pip, no venv, stdlib only)
 - The `unreal` module is always available inside the editor
 - All `unreal.*` calls **must** run on the main editor thread
-- No network access from editor Python except localhost
-- No filesystem writes outside the project directory (sandboxed)
+- Python network APIs are available. This bridge restricts its MCP transport to
+  loopback, while `store.install` performs an explicit external HTTPS download.
+- Filesystem access is not assumed to be sandboxed. Validate every write path;
+  T3D export and `store.install` use the system temporary directory.
+
+### Required UEFN configuration
+
+1. Enable `Python Editor Scripting` in Project Settings.
+2. Enable `UEFN MCP Toolsets` for creator-toolset and MCP capabilities.
+3. In Editor Preferences under `General > Model Context Protocol`, enable
+   `Auto Start Server`.
+4. Run `bridge/server.py` with `Tools > Execute Python Script`, or copy
+   `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside
+   the `bridge/` package for project auto-start.
+
+The bridge defaults to `http://127.0.0.1:9210`. Epic's MCP server defaults to
+`http://127.0.0.1:8000/mcp`. The direct Python bridge remains useful if Epic's
+MCP server is disabled, but UEFN-specific capability gaps cannot use the final
+fallback route.
 
 ## Key Entry Points
 
@@ -48,11 +96,11 @@ These are the subsystems and libraries you'll use most:
 | `EditorAssetLibrary` | 62 | load/save/delete/rename/list assets |
 | `EditorLevelLibrary` | 60 | Spawn actors, viewport camera, world |
 | `MaterialEditingLibrary` | 89 | Material nodes, instances, parameters |
-| `EditorUtilityLibrary` | — | Selected assets in Content Browser |
-| `EditorFilterLibrary` | — | Filter actors by tag/class/layer |
-| `AssetToolsHelpers` | — | `.get_asset_tools()` for import/create |
-| `AssetRegistryHelpers` | — | `.get_asset_registry()` for search |
-| `KismetMathLibrary` | — | Math utilities |
+| `EditorUtilityLibrary` | N/A | Selected assets in Content Browser |
+| `EditorFilterLibrary` | N/A | Filter actors by tag/class/layer |
+| `AssetToolsHelpers` | N/A | `.get_asset_tools()` for import/create |
+| `AssetRegistryHelpers` | N/A | `.get_asset_registry()` for search |
+| `KismetMathLibrary` | N/A | Math utilities |
 
 ## Common Patterns
 
@@ -253,8 +301,12 @@ worker.start()
 
 ## Bridge HTTP Protocol
 
-When using the bridge (external tool → UEFN), commands are sent as HTTP POST
-to `http://127.0.0.1:9210`:
+When using the bridge, external tools send HTTP POST requests to
+`http://127.0.0.1:9210`:
+
+Use `Content-Type: application/json`. The server rejects request bodies above
+16 MiB and browser origins that are not loopback. The bundled clients bypass
+environment proxies for loopback traffic.
 
 ```json
 {
@@ -266,10 +318,14 @@ to `http://127.0.0.1:9210`:
 }
 ```
 
-Response:
+Every command-result envelope includes the route that handled the request.
+HTTP protocol rejections such as invalid JSON, content type, origin, size, or a
+stopping server can omit `route` because no command was dispatched:
+
 ```json
 {
   "ok": true,
+  "route": "python",
   "result": {
     "actor": {
       "name": "StaticMeshActor_0",
@@ -284,10 +340,27 @@ Response:
 }
 ```
 
-### Available Commands
+Possible routes are `python`, `toolset_registry`, and `mcp`. An MCP fallback
+also reports `fallback_reason`. If a dispatched mutation times out or the
+client cannot determine its result, the failure includes:
+
+```json
+{
+  "ok": false,
+  "route": "toolset_registry",
+  "outcome_unknown": true,
+  "error": "The operation may still complete."
+}
+```
+
+Never retry an `outcome_unknown` mutation automatically.
+
+### Direct Python commands
+
+These commands always stay on embedded Python:
 
 | Command | Description |
-|---------|-------------|
+|---|---|
 | `status` | Bridge version, uptime, available commands |
 | `exec` | Run arbitrary Python (assign to `result` to return values) |
 | `log` | Recent bridge log entries |
@@ -295,10 +368,12 @@ Response:
 | `actors.list` | List actors (optional `class_filter`) |
 | `actors.selected` | Currently selected actors |
 | `actors.spawn` | Spawn from `asset_path` or `actor_class` |
+| `actors.duplicate` | Duplicate an actor |
 | `actors.delete` | Delete by path or label (`targets` array) |
 | `actors.transform` | Set location/rotation/scale |
 | `actors.properties` | Read actor properties |
 | `actors.set_property` | Write an actor property |
+| `actors.set_color` | Create and apply a persistent solid-color material |
 | `assets.list` | List assets in directory |
 | `assets.info` | Asset metadata |
 | `assets.exists` | Check if asset exists |
@@ -321,10 +396,103 @@ Response:
 | `batch.exec` | Run multiple commands in one tick |
 | `undo` | Undo last action |
 | `redo` | Redo last undone action |
+| `fix_throttle` | Disable editor background CPU throttling |
+| `reload` | Reload the bridge from disk |
+| `shutdown` | Stop the bridge after flushing the response |
+| `store.install` | Download and install a persistent helper from the bridge store |
+
+`batch.exec` is for direct Python commands only. It rejects friendly aliases,
+`toolsets.*`, and `mcp.*` because Epic tool calls are asynchronous and must be
+serialized.
+
+### UEFN-specific friendly aliases
+
+The following 42 aliases call Epic's in-process Toolset Registry first and use
+the official MCP server only on a safe capability miss:
+
+| Domain | Commands |
+|---|---|
+| Python setup | `uefn.python_enabled`, `uefn.enable_python` |
+| Verse files and build | `verse.write_file`, `verse.replace`, `verse.read_file`, `verse.move`, `verse.list_files`, `verse.grep`, `verse.delete`, `verse.create_directory`, `verse.copy`, `verse.build` |
+| PIC session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log` |
+| Devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding` |
+| Scene Graph entities | `entities.set_transform`, `entities.set_component_property`, `entities.remove_component`, `entities.list_classes`, `entities.list_component_properties`, `entities.list_component_classes`, `entities.get_transform`, `entities.get_components`, `entities.get_component_property`, `entities.find`, `entities.delete`, `entities.create`, `entities.add_component` |
+
+Pass each official tool's arguments directly inside bridge `params`. Inspect the
+schema first when parameter names or reference shapes are not already known.
+When a schema requests an Unreal object reference, it commonly uses an object
+such as `{"refPath":"/Path/To/Object"}`. Do not use that shape when a tool
+expects a plain string.
+
+```json
+{
+  "command": "session.status",
+  "params": {},
+  "timeout_s": 120
+}
+```
+
+### Generic creator-toolset commands
+
+Local routing is pinned to the exact creator-exposed policy from UEFN v42,
+revision `UEFN-v42-CL-56878558`: 29 approved toolsets and 384 approved tools.
+The bridge does not expose registered editor-internal tools through the local
+path.
+
+| Command | Description |
+|---|---|
+| `toolsets.list` | List approved toolsets and tool counts |
+| `toolsets.describe` | Return one full toolset schema |
+| `toolsets.call` | Call an exact toolset and tool name |
+
+Use exact names because tool names can collide between toolsets:
+
+```json
+{
+  "command": "toolsets.call",
+  "params": {
+    "toolset_name": "ValkyrieToolset.SessionToolset",
+    "tool_name": "GetSessionStatus",
+    "arguments": {},
+    "allow_mcp_fallback": true
+  },
+  "timeout_s": 120
+}
+```
+
+Set `allow_mcp_fallback` to `false` to require the in-process registry. Local
+schemas are cached. Pass `refresh: true` to `toolsets.list` or
+`toolsets.describe` after Epic refreshes its tools.
+
+### Forced MCP commands
+
+The official MCP endpoint defaults to `http://127.0.0.1:8000/mcp`. Set
+`UEFN_MCP_URL` before launching the bridge or call `mcp.configure` with another
+loopback URL. Non-loopback MCP endpoints are rejected.
+
+| Command | Description |
+|---|---|
+| `mcp.status` | Initialize MCP and report the negotiated server state |
+| `mcp.list_toolsets` | List toolsets through MCP only |
+| `mcp.describe_toolset` | Fetch one schema through MCP only |
+| `mcp.call` | Invoke one tool through MCP only |
+| `mcp.configure` | Change the loopback endpoint and reset the session |
+| `mcp.reset` | Discard the session and discovery caches |
+
+MCP uses Streamable HTTP and a lazy session. Requests are serialized through
+one mutex, and tool discovery is cached per session. Epic documents UEFN editor
+hitching or hanging during MCP calls, so do not force MCP for work already
+covered by direct Python or the local Toolset Registry.
+
+Official documentation:
+
+- <https://www.fortnite.com/news/unreal-mcp-is-now-available-in-uefn>
+- <https://dev.epicgames.com/documentation/fortnite/uefn-mcp>
+- <https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor>
 
 ## API Surface (37K+ types)
 
-UEFN exposes 37,276 Python types — 4.3x more than standard UE5.  The major
+UEFN exposes 37,276 Python types, 4.3x more than standard UE5. The major
 domains with full read/write support:
 
 | Domain | Key Classes | Capability |
@@ -341,14 +509,38 @@ domains with full read/write support:
 | **Audio** | AudioMixer, MetaSound | Sound management |
 | **Rendering** | MovieRenderPipeline (210 types) | Batch rendering |
 
-### Fortnite-Specific (Limited)
+### Fortnite-specific direct Python limits
 
-28,850 Fortnite types are exposed but mostly **read-only** for inspection:
-- Actor transforms: ✅ writable
-- Gameplay data (weapons, items): read-only
-- No spawning Fortnite actors from Python
-- No Verse bridge (can inspect but not call)
-- Editor use: asset validation, bulk editing, quest tools
+Many Fortnite types exposed to Python are useful mainly for inspection. Direct
+Python can write normal editor actor transforms, but it cannot safely cover
+every UEFN-specific device, entity, session, or Verse workflow.
+
+Use the hybrid aliases for those gaps:
+
+- Use `devices.*` to place and configure supported Creative devices and event
+  bindings.
+- Use `entities.*` for supported Scene Graph entity and component operations.
+- Use the file-oriented `verse.*` aliases to read, edit, move, search, and build
+  Verse source.
+- Use `session.*` for Play in Client (PIC) session control and inspection.
+
+Python and the creator toolsets do not turn editor automation into gameplay
+runtime code. Gameplay logic, player interaction, and game rules still belong
+in Verse. File and build tools do not provide arbitrary calls into running Verse
+functions.
+
+### Session and coordinate caveats
+
+Epic's session tools target PIC, not Play in Editor (PIE). Treat a
+`StillRunning` result as transient: poll `session.status` before issuing another
+session mutation.
+
+Python and the creator toolset JSON schemas express vectors as X, Y, and Z.
+UEFN Scene Graph and `/Verse.org/SpatialMath` use Forward, Left, and Up (LUF).
+For `entities.*`, send the X, Y, and Z fields required by the tool schema even
+though Verse represents the affected transform as LUF. Do not swap or rename
+axes by intuition. The older `/UnrealEngine.com/Temporary/SpatialMath` types are
+distinct from `/Verse.org/SpatialMath` and require documented conversions.
 
 ## Editing Placed Verse Devices (@editable values)
 
@@ -487,28 +679,43 @@ Writes mutate the open level, so get user approval before editing or saving.
 
 ## Critical Rules
 
-1. **Thread safety**: All `unreal.*` calls must run on the main thread.  If you're
-   writing a script that runs directly in UEFN, you're already on the main thread.
-   If you're using the bridge, it handles threading for you.
+1. **Thread safety**: All `unreal.*` calls must run on the main thread. If you are
+   writing a script that runs directly in UEFN, you are already on the main
+   thread. The bridge handles main-thread dispatch and async-result polling.
 
-2. **No pip**: UEFN's embedded Python has no package manager.  Only stdlib and
+2. **No pip**: UEFN's embedded Python has no package manager. Only stdlib and
    `unreal` are available inside the editor.
 
-3. **Editor only**: Python runs in the editor, not at game runtime.  Use Verse
+3. **Editor only**: Python runs in the editor, not at game runtime. Use Verse
    for gameplay logic, player interaction, and game rules.
 
-4. **Save explicitly**: Changes to assets aren't saved automatically.  Call
+4. **Save explicitly**: Changes to assets are not saved automatically. Call
    `unreal.EditorAssetLibrary.save_asset(path)` or `save_current_level()`.
 
 5. **Path format**: Asset paths use forward slashes and start with `/Game/`:
    `/Game/Materials/M_Base`, `/Engine/BasicShapes/Cube`.
 
-6. **Vectors and Rotators**: Always construct with `unreal.Vector(x, y, z)` and
-   `unreal.Rotator(pitch, yaw, roll)`.  Pitch = up/down, Yaw = left/right,
-   Roll = tilt.
+6. **Vectors and Rotators**: For Python, construct `unreal.Vector(x, y, z)` and
+   `unreal.Rotator(pitch, yaw, roll)`. Do not confuse Python XYZ with Scene
+   Graph LUF values.
 
-7. **Error handling**: Wrap operations in try/except.  `unreal.log_error(msg)`
-   writes to the Output Log.  `unreal.log_warning(msg)` for non-fatal issues.
+7. **Error handling**: Wrap operations in try/except. `unreal.log_error(msg)`
+   writes to the Output Log. Use `unreal.log_warning(msg)` for non-fatal issues.
 
 8. **Progress for batch ops**: Use `unreal.ScopedSlowTask` for any operation
    touching 50+ assets/actors to show progress and allow cancellation.
+
+9. **Fastest valid route**: Use named direct Python commands first, friendly
+   aliases second, generic approved toolsets third, and forced MCP only for
+   diagnostics or a capability that cannot use the earlier routes.
+
+10. **No blind replay**: Never retry a mutation when `outcome_unknown` is true.
+    Read back editor state first. A timeout is not proof that a mutation failed.
+
+11. **Exact tool identity**: For generic calls, use the complete toolset name and
+    exact tool name from `toolsets.describe`. Do not infer tools from registered
+    editor internals or bypass the pinned creator-exposed policy.
+
+12. **Serialized calls**: Do not overlap Toolset Registry or MCP operations, and
+    do not put them in `batch.exec`. Poll PIC session state explicitly when an
+    operation reports `StillRunning`.
