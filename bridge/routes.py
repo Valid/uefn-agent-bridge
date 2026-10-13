@@ -180,8 +180,10 @@ def default_deadline_s(command: str, params: Optional[dict] = None, fallback: fl
     """
     route = TOOLSET_ROUTES.get(command)
     if route is None and command in ("toolsets.call", "mcp.call") and isinstance(params, dict):
-        toolset, tool = params.get("toolset_name"), params.get("tool_name")
-        if isinstance(toolset, str) and isinstance(tool, str):
+        toolset = params.get("toolset_name")
+        # Qualified names ("Toolset.Tool") are accepted like short ones.
+        tool = short_tool_name(toolset, params.get("tool_name"))
+        if tool:
             route = (toolset, tool)
     return SLOW_TOOL_DEADLINES_S.get(route, fallback) if route else fallback
 

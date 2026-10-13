@@ -39,6 +39,15 @@ class DefaultDeadlineTests(unittest.TestCase):
         self.assertEqual(routes.default_deadline_s("toolsets.call", params), 600.0)
         self.assertEqual(routes.default_deadline_s("mcp.call", params), 600.0)
 
+    def test_qualified_tool_names_get_the_same_deadline(self):
+        params = {
+            "toolset_name": "ValkyrieToolset.SessionToolset",
+            "tool_name": "ValkyrieToolset.SessionToolset.StartSession",
+        }
+        self.assertEqual(routes.default_deadline_s("toolsets.call", params), 600.0)
+        mismatched = dict(params, tool_name="ValkyrieToolset.VerseToolset.StartSession")
+        self.assertEqual(routes.default_deadline_s("toolsets.call", mismatched, 30.0), 30.0)
+
     def test_everything_else_keeps_the_fallback(self):
         self.assertEqual(routes.default_deadline_s("actors.list", {}, 30.0), 30.0)
         self.assertEqual(routes.default_deadline_s("session.status", {}, 30.0), 30.0)
