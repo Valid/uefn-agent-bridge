@@ -76,7 +76,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.4.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.5.0 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 90 commands registered
 ```
 
@@ -261,6 +261,8 @@ These direct `verse.*` commands inspect placed generated device objects. They ar
 | `undo`, `redo` | Use the editor transaction history |
 | `log`, `history` | Inspect bridge diagnostics |
 | `reload`, `shutdown` | Manage the bridge process |
+| `bridge.check_update` | Check now whether a newer bridge is published |
+| `bridge.update` | Install the published bridge files, verified, then reload (Updates below) |
 | `fix_throttle` | Disable background CPU throttling |
 | `store.install` | Install the persistent helper store |
 
@@ -365,6 +367,20 @@ Find a placed `VerseDevice_C` actor by internal name, then export its serialized
 
 Plain property access works for numbers, object references, and reference arrays. Verse string, enum, and option values require the editor text-import roundtrip documented in [`RULES.md`](RULES.md). Writes mutate the open level, so get user approval before editing or saving.
 
+## Updates
+
+A few seconds after it starts, the bridge reads the published `bridge/release.json` from this repository's `main` branch. If that version is newer, the Output Log says so once, and `status` and `GET /` carry the result:
+
+```json
+"update": {"current": "0.5.0", "latest": "0.5.1", "available": true, "checked_at": "2026-10-13T04:00:00Z", "error": null, "install": "copy"}
+```
+
+- **Install it:** send `{"command": "bridge.update"}`. The bridge downloads every file the manifest lists, checks each file's SHA-256 against it, and changes nothing unless all of them match. Each install copies the files it replaces to its own `bridge/.bridge-backup/<installed version>-<UTC time>/` folder, swaps the new ones in (rolling back if a swap fails), and reloads itself once no command is running or waiting on a native tool. Pass `"reload": false` to reload later; a later `bridge.update` or `reload` picks up the installed files. It never installs an older version unless you pass `"allow_downgrade": true`.
+- **Git checkouts are left to git.** When the bridge runs from a clone of this repository, `install` is `"git"` and `bridge.update` refuses; run `git pull` there instead.
+- **Automatic updates are off by default.** The bridge usually lives inside a project's `Content/Python/`, so an update changes project files that revision control will pick up. To install updates automatically at startup, add `bridge/settings.json` with `{"auto_update": true}`. To stop the startup check, use `{"check_for_updates": false}`. The environment variables `UEFN_BRIDGE_AUTO_UPDATE` and `UEFN_BRIDGE_UPDATE_CHECK` (`1` or `0`) override the file.
+- The check is one HTTPS request to `raw.githubusercontent.com` per bridge start, with no identifying data beyond the request itself. A failed check is reported in `update.error` and never stops the bridge.
+- Bridges older than 0.5.0 do not check. Update those by copying the `bridge/` folder once.
+
 ## How It Works
 
 1. A local HTTP server listens on `127.0.0.1:9210` or the next free bridge port.
@@ -387,13 +403,15 @@ bridge/
   uefn_tool_policy.py  Exact UEFN v42 local tool allowlist
   mcp_client.py        Stdlib-only official UEFN MCP client
   startup.py           Optional UEFN init_unreal.py auto-start helper
+  updates.py           Update check and verified install
+  release.json         Published version and file digests (tools/write_release_manifest.py)
 
 examples/
   hybrid_routing.py    Read-only routing and discovery example
   verse_devices.py     Placed Verse device workflow
 
 tests/                 Unit tests that run outside UEFN with fakes
-tools/                 API introspection and stub-generation helpers
+tools/                 API introspection, stub generation, release manifest
 RULES.md               LLM context and operating rules
 ```
 
@@ -416,7 +434,7 @@ RULES.md               LLM context and operating rules
 - Any request can include a top-level `timeout_s` up to 600 seconds; without one, slow session and build tools get longer defaults (Busy, Stalled, and Deadlines above). A timeout after dispatch is not proof that the operation failed.
 - If background throttling returns, run `fix_throttle` or focus UEFN.
 - Start manually with `bridge/server.py`, or copy `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside the `bridge/` package for project auto-start.
-- Use `reload` after changing only `bridge/server.py`. Restart UEFN after changing sibling modules such as `routes.py`, `uefn_tool_policy.py`, or `mcp_client.py`; simply re-running `server.py` does not evict those modules from Python's import cache.
+- `reload` re-reads `server.py` and its sibling modules (`routes.py`, `uefn_tool_policy.py`, `mcp_client.py`, `updates.py`) from disk, so a changed sibling module no longer needs a UEFN restart.
 - The bridge only connects to loopback MCP endpoints and has no remote-access mode.
 
 ## Contributing
@@ -427,6 +445,7 @@ To add a direct Python command:
 2. Add the command to `PYTHON_COMMANDS` in `bridge/routes.py`.
 3. Add tests and a working example.
 4. Update `RULES.md` and this README.
+5. After changing any file in `bridge/` (or `VERSION` in `server.py`), run `python tools/write_release_manifest.py`. `tests/test_updates.py` fails until the manifest matches, because installed bridges verify their downloads against it.
 
 When Epic changes its creator toolsets, review the official exposed schemas before updating `bridge/uefn_tool_policy.py`. Do not widen the local policy from registered toolsets alone.
 

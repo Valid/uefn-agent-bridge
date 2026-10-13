@@ -50,6 +50,8 @@ PYTHON_COMMANDS = frozenset({
     "assets.search",
     "assets.selected",
     "batch.exec",
+    "bridge.check_update",
+    "bridge.update",
     "exec",
     "fix_throttle",
     "history",
