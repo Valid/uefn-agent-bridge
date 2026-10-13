@@ -111,14 +111,14 @@ import unreal
 
 # From an asset (mesh, blueprint, etc.)
 loc = unreal.Vector(500, 0, 100)
-rot = unreal.Rotator(0, 45, 0)
+rot = unreal.Rotator(roll=0, pitch=0, yaw=45)  # always by keyword: positional order is (roll, pitch, yaw)
 asset = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Cube")
 actor = unreal.EditorLevelLibrary.spawn_actor_from_object(asset, loc, rot)
 actor.set_actor_label("MyCube")
 
 # From a class
 light = unreal.EditorLevelLibrary.spawn_actor_from_class(
-    unreal.PointLight, unreal.Vector(0, 0, 300), unreal.Rotator(0, 0, 0)
+    unreal.PointLight, unreal.Vector(0, 0, 300), unreal.Rotator()
 )
 ```
 
@@ -126,7 +126,7 @@ light = unreal.EditorLevelLibrary.spawn_actor_from_class(
 
 ```python
 actor.set_actor_location(unreal.Vector(100, 200, 0), False, False)
-actor.set_actor_rotation(unreal.Rotator(0, 90, 0), False)
+actor.set_actor_rotation(unreal.Rotator(roll=0, pitch=0, yaw=90), False)
 actor.set_actor_scale3d(unreal.Vector(2, 2, 2))
 
 # Read back
@@ -260,7 +260,7 @@ loc, rot = unreal.EditorLevelLibrary.get_level_viewport_camera_info()
 # Set camera
 unreal.EditorLevelLibrary.set_level_viewport_camera_info(
     unreal.Vector(1000, 0, 500),
-    unreal.Rotator(-30, 0, 0)
+    unreal.Rotator(roll=0, pitch=-30, yaw=0)
 )
 ```
 
@@ -696,7 +696,11 @@ Writes mutate the open level, so get user approval before editing or saving.
    `/Game/Materials/M_Base`, `/Engine/BasicShapes/Cube`.
 
 6. **Vectors and Rotators**: For Python, construct `unreal.Vector(x, y, z)` and
-   `unreal.Rotator(pitch, yaw, roll)`. Do not confuse Python XYZ with Scene
+   `unreal.Rotator(roll=..., pitch=..., yaw=...)`. Always pass rotator values
+   by keyword: the positional order is (roll, pitch, yaw), so the positional
+   values `0, 90, 0` pitch the actor 90 degrees instead of turning it. The
+   bridge's own `rotation` parameters are `[pitch, yaw, roll]` lists or
+   `{"pitch", "yaw", "roll"}` objects. Do not confuse Python XYZ with Scene
    Graph LUF values.
 
 7. **Error handling**: Wrap operations in try/except. `unreal.log_error(msg)`
