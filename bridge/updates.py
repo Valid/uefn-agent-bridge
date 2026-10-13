@@ -151,8 +151,9 @@ def apply_update(
     """Install the published bridge files into ``bridge_dir``.
 
     Every file is downloaded and verified before anything on disk changes.
-    The files being replaced are copied to ``.bridge-backup/<old version>/``
-    first, and restored if a replacement fails part way. A bridge running
+    The files being replaced are copied to a new
+    ``.bridge-backup/<installed version>-<UTC time>/`` folder first, and
+    restored if a replacement fails part way. A bridge running
     from a git checkout is left alone: update it with ``git pull``.
     """
     checkout = find_git_checkout(bridge_dir)
@@ -166,13 +167,26 @@ def apply_update(
         _INSTALL_LOCK.release()
 
 
+def installed_version(bridge_dir: str) -> Optional[str]:
+    """The version of the files on disk, from their release.json, if readable."""
+    try:
+        with open(os.path.join(bridge_dir, MANIFEST_NAME), "rb") as handle:
+            return parse_manifest(handle.read())["version"]
+    except (OSError, UpdateError):
+        return None
+
+
 def _install(bridge_dir: str, current_version: str, fetch: Fetch, allow_downgrade: bool) -> dict:
     manifest = parse_manifest(fetch(RAW_BASE + MANIFEST_NAME, FETCH_TIMEOUT_S))
     latest = manifest["version"]
-    if parse_version(latest) == parse_version(current_version):
-        return {"updated": False, "version": latest, "files": []}
-    if parse_version(latest) < parse_version(current_version) and not allow_downgrade:
-        raise UpdateError(f"published version {latest} is older than the running {current_version}")
+    # The files on disk can be newer than the running code (installed, not yet
+    # reloaded); compare and label backups by what is on disk.
+    installed = installed_version(bridge_dir) or current_version
+    if parse_version(latest) == parse_version(installed):
+        return {"updated": False, "version": latest, "installed": installed, "files": [],
+                "reload_needed": parse_version(installed) != parse_version(current_version)}
+    if parse_version(latest) < parse_version(installed) and not allow_downgrade:
+        raise UpdateError(f"published version {latest} is older than the installed {installed}")
 
     downloads: Dict[str, bytes] = {}
     for name, digest in manifest["files"].items():
@@ -184,10 +198,16 @@ def _install(bridge_dir: str, current_version: str, fetch: Fetch, allow_downgrad
             )
         downloads[name] = data
 
-    backup_dir = os.path.join(bridge_dir, BACKUP_DIR_NAME, current_version)
-    os.makedirs(backup_dir, exist_ok=True)
+    # A new folder for every install, so a later install never overwrites an earlier backup.
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup_dir = os.path.join(bridge_dir, BACKUP_DIR_NAME, f"{installed}-{stamp}")
+    suffix = 1
+    while os.path.exists(backup_dir):
+        suffix += 1
+        backup_dir = os.path.join(bridge_dir, BACKUP_DIR_NAME, f"{installed}-{stamp}-{suffix}")
     staged: List[str] = []
     try:
+        os.makedirs(backup_dir)
         for name, data in downloads.items():
             staging = os.path.join(bridge_dir, name + ".new")
             with open(staging, "wb") as handle:
@@ -204,6 +224,7 @@ def _install(bridge_dir: str, current_version: str, fetch: Fetch, allow_downgrad
     except OSError as exc:
         for path in staged:
             _remove_quietly(path)
+        shutil.rmtree(backup_dir, ignore_errors=True)
         raise UpdateError(f"could not stage the update: {exc}") from exc
 
     replaced: List[str] = []
@@ -221,8 +242,8 @@ def _install(bridge_dir: str, current_version: str, fetch: Fetch, allow_downgrad
         for path in staged:
             _remove_quietly(path)
         raise UpdateError(f"replacing the bridge files failed and was rolled back: {exc}") from exc
-    return {"updated": True, "version": latest, "previous": current_version,
-            "files": sorted(downloads), "backup": backup_dir}
+    return {"updated": True, "version": latest, "previous": installed,
+            "files": sorted(downloads), "backup": backup_dir, "reload_needed": True}
 
 
 def _remove_quietly(path: str) -> None:

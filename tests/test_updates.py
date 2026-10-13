@@ -118,7 +118,10 @@ class ApplyUpdateTests(unittest.TestCase):
         self.assertEqual((outcome["version"], outcome["previous"]), ("0.6.0", "0.5.0"))
         for name, data in self.NEW.items():
             self.assertEqual(self.read(name), data)
-        backup = self.dir / updates.BACKUP_DIR_NAME / "0.5.0"
+        backups = list((self.dir / updates.BACKUP_DIR_NAME).glob("0.5.0-*"))
+        self.assertEqual(len(backups), 1)
+        backup = backups[0]
+        self.assertEqual(Path(outcome["backup"]), backup)
         self.assertEqual((backup / "server.py").read_bytes(), self.OLD["server.py"])
         self.assertEqual((backup / "routes.py").read_bytes(), self.OLD["routes.py"])
         self.assertEqual(json.loads(self.read(updates.MANIFEST_NAME))["version"], "0.6.0")
@@ -157,6 +160,23 @@ class ApplyUpdateTests(unittest.TestCase):
             updates.apply_update(str(self.dir), "0.7.0", FakeRepository("0.6.0", self.NEW))
         down = updates.apply_update(str(self.dir), "0.7.0", FakeRepository("0.6.0", self.NEW), allow_downgrade=True)
         self.assertTrue(down["updated"])
+
+    def test_installing_again_before_a_reload_keeps_the_original_backup(self):
+        first = updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
+        again = updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
+        self.assertEqual((again["updated"], again["installed"], again["reload_needed"]), (False, "0.6.0", True))
+        self.assertEqual((Path(first["backup"]) / "server.py").read_bytes(), self.OLD["server.py"])
+        self.assertEqual(len(list((self.dir / updates.BACKUP_DIR_NAME).iterdir())), 1)
+
+    def test_each_install_gets_its_own_backup_labeled_by_the_files_it_replaced(self):
+        newer = dict(self.NEW, **{"server.py": b'VERSION = "0.7.0"\n'})
+        first = updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
+        second = updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.7.0", newer))
+        self.assertNotEqual(first["backup"], second["backup"])
+        self.assertEqual(second["previous"], "0.6.0")
+        self.assertTrue(Path(second["backup"]).name.startswith("0.6.0-"))
+        self.assertEqual((Path(first["backup"]) / "server.py").read_bytes(), self.OLD["server.py"])
+        self.assertEqual((Path(second["backup"]) / "server.py").read_bytes(), self.NEW["server.py"])
 
     def test_a_second_concurrent_install_is_refused(self):
         self.assertTrue(updates._INSTALL_LOCK.acquire(blocking=False))
@@ -253,21 +273,61 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual((update["latest"], update["available"]), ("9.0.0", True))
         self.assertIn(update["install"], ("git", "copy", "unknown"))
 
-    def test_update_requests_a_reload_that_the_tick_schedules(self):
-        outcome = {"updated": True, "version": "9.0.0", "previous": server.VERSION, "files": ["server.py"], "backup": "b"}
+    OUTCOME = {"updated": True, "version": "9.0.0", "previous": "0.5.0", "files": ["server.py"],
+               "backup": "b", "reload_needed": True}
+
+    def request_update(self, **kwargs):
         with mock.patch.object(server, "_bridge_dir", return_value=str(REPO / "bridge")), \
-                mock.patch.object(server.updates, "apply_update", return_value=dict(outcome)), \
+                mock.patch.object(server.updates, "apply_update", return_value=dict(self.OUTCOME)), \
                 mock.patch.object(server.updates, "check", return_value={"available": False}):
-            result = server._cmd_bridge_update()
-        self.assertTrue(result["reloading"])
+            return server._cmd_bridge_update(**kwargs)
+
+    def ticks(self, count=2):
         scheduled = []
         with mock.patch.object(server, "_schedule_editor_callback", side_effect=scheduled.append):
-            server._tick(0.0)
-            server._tick(0.0)
-        self.assertEqual(scheduled, [server._reload_from_disk])
+            for _ in range(count):
+                server._tick(0.0)
+        return scheduled
+
+    def test_update_requests_a_reload_that_the_tick_schedules_holding_the_turn(self):
+        self.assertTrue(self.request_update()["reloading"])
+        scheduled = self.ticks()
+        self.assertEqual(len(scheduled), 1)
+        self.assertIs(scheduled[0].func, server._reload_from_disk)
+        self.assertEqual(scheduled[0].keywords, {"release_turn": True})
+        self.assertFalse(server._request_serial_lock.acquire(blocking=False), "the reload holds the turn")
+        with mock.patch.object(server, "stop"), mock.patch.dict(sys.modules), \
+                mock.patch("builtins.open", side_effect=OSError("stop here")):
+            with self.assertRaises(OSError):
+                scheduled[0]()
+        self.assertTrue(server._request_serial_lock.acquire(blocking=False), "stopping releases the turn")
+        server._request_serial_lock.release()
+
+    def test_reload_waits_for_a_pending_native_tool_and_a_held_turn(self):
+        class StillRunning:
+            command, started_mono = "session.start", 0.0
+
+            def poll(self):
+                return None
+
+        self.request_update()
+        server._pending_tool_calls["pending-1"] = StillRunning()
+        try:
+            self.assertEqual(self.ticks(), [])
+        finally:
+            server._pending_tool_calls.clear()
+            server._set_editor_command()
+        server._request_serial_lock.acquire()
+        try:
+            self.assertEqual(self.ticks(), [])
+        finally:
+            server._request_serial_lock.release()
+        scheduled = self.ticks()
+        self.assertEqual(len(scheduled), 1)
+        server._request_serial_lock.release()
 
     def test_update_without_reload_leaves_the_bridge_running(self):
-        outcome = {"updated": True, "version": "9.0.0", "previous": server.VERSION, "files": [], "backup": "b"}
+        outcome = dict(self.OUTCOME)
         with mock.patch.object(server, "_bridge_dir", return_value=str(REPO / "bridge")), \
                 mock.patch.object(server.updates, "apply_update", return_value=dict(outcome)), \
                 mock.patch.object(server.updates, "check", return_value={"available": False}):

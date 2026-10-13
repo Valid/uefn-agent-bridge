@@ -15,6 +15,7 @@ Docs & source: https://github.com/Valid/uefn-python-bridge
 
 from __future__ import annotations
 
+import functools
 import io
 import ipaddress
 import json
@@ -901,10 +902,19 @@ def _cmd_shutdown() -> dict:
 _SIBLING_MODULES = ("routes", "uefn_tool_policy", "mcp_client", "updates", "client")
 
 
-def _reload_from_disk() -> None:
-    """Stop, then run server.py again from disk with fresh sibling modules."""
+def _reload_from_disk(release_turn: bool = False) -> None:
+    """Stop, then run server.py again from disk with fresh sibling modules.
+
+    ``release_turn``: the caller took the dispatch turn so no command could
+    start before the reload. It is released once the server has stopped, so
+    any request still waiting for it is answered as "stopping".
+    """
     script_path = _SCRIPT_PATH
-    stop()
+    try:
+        stop()
+    finally:
+        if release_turn:
+            _request_serial_lock.release()
     _log("Reloading from disk...")
     for name in _SIBLING_MODULES:
         sys.modules.pop(name, None)
@@ -984,7 +994,9 @@ def _background_update_check(delay_s: float = 3.0) -> None:
         _log(f"Automatic bridge update failed; nothing was replaced or it was rolled back: {exc}", "error")
         return
     if outcome.get("updated"):
-        _log(f"Bridge updated to {outcome['version']} (backup in {outcome['backup']}); reloading", "warn")
+        _log(f"Bridge updated to {outcome['version']} (backup in {outcome['backup']}); "
+             "reloading once no command is running", "warn")
+    if outcome.get("reload_needed"):
         _reload_requested = True
 
 
@@ -1001,8 +1013,10 @@ def _cmd_bridge_update(reload: bool = True, allow_downgrade: bool = False) -> di
     """Download, verify and install the published bridge files, then reload.
 
     Every file is verified against the release manifest before anything is
-    replaced, and the replaced files are kept in .bridge-backup/<version>/.
-    A bridge running from a git checkout is not changed; use git pull.
+    replaced, and each install keeps the files it replaced in its own
+    .bridge-backup/<installed version>-<UTC time>/ folder. A bridge running
+    from a git checkout is not changed; use git pull. The reload waits until
+    no command is running or pending.
     """
     global _reload_requested
     bridge_dir = _bridge_dir()
@@ -1011,9 +1025,10 @@ def _cmd_bridge_update(reload: bool = True, allow_downgrade: bool = False) -> di
     outcome = updates.apply_update(bridge_dir, VERSION, allow_downgrade=allow_downgrade)
     if outcome.get("updated"):
         _record_update_check(updates.check(outcome["version"]))
-        if reload:
-            _reload_requested = True
-    outcome["reloading"] = bool(outcome.get("updated") and reload)
+    # Also reload when an earlier install with reload=false left newer files on disk.
+    outcome["reloading"] = bool(outcome.get("reload_needed") and reload)
+    if outcome["reloading"]:
+        _reload_requested = True
     return outcome
 
 
@@ -2364,9 +2379,16 @@ def _tick(dt: float) -> None:
     _tick_health += 1
     with _activity_lock:
         _last_tick_mono = time.monotonic()
-    if _reload_requested:
+    # A requested reload waits until nothing is running, queued or pending on a
+    # native tool, and takes the dispatch turn so nothing starts before it.
+    if (
+        _reload_requested
+        and not _pending_tool_calls
+        and _work_queue.empty()
+        and _request_serial_lock.acquire(blocking=False)
+    ):
         _reload_requested = False
-        _schedule_editor_callback(_reload_from_disk)
+        _schedule_editor_callback(functools.partial(_reload_from_disk, release_turn=True))
     _poll_pending_tool_calls()
     if _pending_tool_calls:
         return
