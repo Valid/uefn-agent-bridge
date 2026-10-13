@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
-Drive **Unreal Editor for Fortnite (UEFN)** from outside the editor. The bridge runs inside UEFN and gives any AI coding agent (Claude Code, Codex, Cursor, GitHub Copilot), script or CI job a local HTTP API to the editor: spawn and edit actors, place and configure Creative devices, read and write Verse `@editable` properties, build Verse, launch play sessions and push changes, and call every creator toolset Epic exposes to UEFN, including Verse files, sessions, devices and Scene Graph entities.
+[UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) lets AI agents such as Claude Code and ChatGPT Codex, your own scripts and your CI pipeline drive Unreal Editor for Fortnite directly. Drop it into your island's `Content/Python` folder and UEFN gains a local HTTP API: spawn and arrange actors, place and wire Creative devices, set Verse `@editable` properties, write and build Verse, launch play sessions and push changes. It pairs the speed of UEFN's embedded Python with the full reach of Epic's creator toolsets and MCP, and it is built for unattended work: one command at a time, nothing replayed after a timeout, clear busy-versus-stalled status, and verified one-command updates. Free and open source under MIT; come build with us on [Discord](https://discord.gg/fchq).
 
 It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Python, so it works from any language. A stdlib-only Python client is included.
 

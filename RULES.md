@@ -4,9 +4,9 @@
 > scripts and safe hybrid tool calls. Works with any LLM, including Claude,
 > GPT, Gemini, and Llama.
 >
+> For Claude Code (Anthropic): copy to `CLAUDE.md`
+> For Codex (OpenAI / ChatGPT): copy to `AGENTS.md`
 > For Cursor: copy to `.cursorrules`
-> For Claude Code: copy to `CLAUDE.md`
-> For OpenClaw: copy to your skill's `SKILL.md`
 
 ---
 
