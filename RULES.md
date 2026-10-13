@@ -57,6 +57,8 @@ not UI automation.
 - All `unreal.*` calls **must** run on the main editor thread
 - Python network APIs are available. This bridge restricts its MCP transport to
   loopback, while `store.install` performs an explicit external HTTPS download.
+  The bridge also reads its own release manifest over HTTPS once per start
+  (`bridge.check_update`), and `bridge.update` downloads verified bridge files.
 - Filesystem access is not assumed to be sandboxed. Validate every write path;
   T3D export and `store.install` use the system temporary directory.
 
@@ -397,7 +399,9 @@ These commands always stay on embedded Python:
 | `undo` | Undo last action |
 | `redo` | Redo last undone action |
 | `fix_throttle` | Disable editor background CPU throttling |
-| `reload` | Reload the bridge from disk |
+| `reload` | Reload the bridge and its sibling modules from disk |
+| `bridge.check_update` | Check whether a newer bridge is published |
+| `bridge.update` | Install the published bridge files after verifying them, then reload |
 | `shutdown` | Stop the bridge after flushing the response |
 | `store.install` | Download and install a persistent helper from the bridge store |
 

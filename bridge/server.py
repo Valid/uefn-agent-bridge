@@ -75,6 +75,7 @@ try:
         short_tool_name,
     )
     from .uefn_tool_policy import UEFN_TOOL_POLICY_REVISION
+    from . import updates
 except ImportError:
     # Execute Python Script loads this file outside the bridge package.
     from routes import (  # type: ignore
@@ -85,6 +86,7 @@ except ImportError:
         short_tool_name,
     )
     from uefn_tool_policy import UEFN_TOOL_POLICY_REVISION  # type: ignore
+    import updates  # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -97,7 +99,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -811,6 +813,7 @@ def _cmd_status() -> dict:
         "uptime_s": round(time.monotonic() - _start_mono, 1) if _start_mono else 0,
         "commands": sorted(_commands),
         "activity": _activity_snapshot(),
+        "update": _update_snapshot(),
         "routing": {
             "strategy": ["python", "toolset_registry", "mcp"],
             "toolset_aliases": sorted(TOOLSET_ROUTES),
@@ -894,22 +897,124 @@ def _cmd_shutdown() -> dict:
     return {"message": "Shutting down..."}
 
 
+# Modules next to server.py. A reload evicts them so it picks up new copies.
+_SIBLING_MODULES = ("routes", "uefn_tool_policy", "mcp_client", "updates", "client")
+
+
+def _reload_from_disk() -> None:
+    """Stop, then run server.py again from disk with fresh sibling modules."""
+    script_path = _SCRIPT_PATH
+    stop()
+    _log("Reloading from disk...")
+    for name in _SIBLING_MODULES:
+        sys.modules.pop(name, None)
+        sys.modules.pop(f"bridge.{name}", None)
+    with open(script_path, "r", encoding="utf-8") as f:
+        code = f.read()
+    exec(code, {"__file__": script_path, "__name__": "__reloaded__", "__builtins__": __builtins__})
+
+
 @command("reload")
 def _cmd_reload() -> dict:
-    """Stop the server, re-read the script from disk, and restart."""
+    """Stop the server, re-read the bridge files from disk, and restart."""
     script_path = _SCRIPT_PATH
     if not script_path or not os.path.isfile(script_path):
         return {"error": f"Cannot find script path (got: {script_path!r}). Restart manually."}
-
-    def _do_reload():
-        stop()
-        _log("Reloading from disk...")
-        with open(script_path, "r") as f:
-            code = f.read()
-        exec(code, {"__file__": script_path, "__name__": "__reloaded__", "__builtins__": __builtins__})
-
-    _schedule_editor_callback(_do_reload)
+    _schedule_editor_callback(_reload_from_disk)
     return {"message": f"Reloading from {script_path}..."}
+
+
+# ── Updates ────────────────────────────────────────────────────────────────
+
+_update_state: Optional[dict] = None
+_update_lock = threading.Lock()
+_reload_requested = False       # set off the editor thread; _tick schedules the reload
+
+
+def _bridge_dir() -> str:
+    return os.path.dirname(_SCRIPT_PATH) if _SCRIPT_PATH else ""
+
+
+def _update_snapshot() -> Optional[dict]:
+    with _update_lock:
+        state = dict(_update_state) if _update_state else None
+    if state is not None:
+        bridge_dir = _bridge_dir()
+        state["install"] = (
+            "unknown" if not bridge_dir
+            else "git" if updates.find_git_checkout(bridge_dir)
+            else "copy"
+        )
+    return state
+
+
+def _record_update_check(state: dict) -> None:
+    global _update_state
+    with _update_lock:
+        _update_state = state
+    if state.get("available"):
+        bridge_dir = _bridge_dir()
+        how = (
+            "run git pull in the bridge checkout"
+            if bridge_dir and updates.find_git_checkout(bridge_dir)
+            else 'run the bridge command "bridge.update"'
+        )
+        _log(
+            f"Bridge {VERSION} is out of date: {state['latest']} is available. "
+            f"To update, {how}.",
+            "warn",
+        )
+
+
+def _background_update_check(delay_s: float = 3.0) -> None:
+    """Check for a newer bridge once after start; install it if auto_update is on."""
+    global _reload_requested
+    bridge_dir = _bridge_dir()
+    settings = updates.load_settings(bridge_dir) if bridge_dir else {"check_for_updates": True, "auto_update": False}
+    if not settings["check_for_updates"]:
+        return
+    time.sleep(delay_s)
+    state = updates.check(VERSION)
+    _record_update_check(state)
+    if not (state.get("available") and settings["auto_update"] and bridge_dir):
+        return
+    try:
+        outcome = updates.apply_update(bridge_dir, VERSION)
+    except Exception as exc:
+        _log(f"Automatic bridge update failed; nothing was replaced or it was rolled back: {exc}", "error")
+        return
+    if outcome.get("updated"):
+        _log(f"Bridge updated to {outcome['version']} (backup in {outcome['backup']}); reloading", "warn")
+        _reload_requested = True
+
+
+@command("bridge.check_update")
+def _cmd_bridge_check_update() -> dict:
+    """Check now whether a newer bridge is published."""
+    state = updates.check(VERSION)
+    _record_update_check(state)
+    return _update_snapshot() or state
+
+
+@command("bridge.update")
+def _cmd_bridge_update(reload: bool = True, allow_downgrade: bool = False) -> dict:
+    """Download, verify and install the published bridge files, then reload.
+
+    Every file is verified against the release manifest before anything is
+    replaced, and the replaced files are kept in .bridge-backup/<version>/.
+    A bridge running from a git checkout is not changed; use git pull.
+    """
+    global _reload_requested
+    bridge_dir = _bridge_dir()
+    if not bridge_dir or not os.path.isfile(os.path.join(bridge_dir, "server.py")):
+        raise RuntimeError("Cannot find the bridge folder to update. Update the files manually.")
+    outcome = updates.apply_update(bridge_dir, VERSION, allow_downgrade=allow_downgrade)
+    if outcome.get("updated"):
+        _record_update_check(updates.check(outcome["version"]))
+        if reload:
+            _reload_requested = True
+    outcome["reloading"] = bool(outcome.get("updated") and reload)
+    return outcome
 
 
 # ── Actor commands ─────────────────────────────────────────────────────────
@@ -1689,6 +1794,7 @@ class _Handler(BaseHTTPRequestHandler):
             "port": _active_port,
             "commands": sorted(_commands),
             "activity": _activity_snapshot(),
+            "update": _update_snapshot(),
         }).encode()
         self._respond(200, body)
 
@@ -2088,6 +2194,8 @@ _HTTP_THREAD_COMMANDS = frozenset({
     "status",
     "log",
     "history",
+    "bridge.check_update",
+    "bridge.update",
     "mcp.status",
     "mcp.list_toolsets",
     "mcp.describe_toolset",
@@ -2105,6 +2213,7 @@ _UNSERIALIZED_HTTP_COMMANDS = frozenset({
     "status",
     "log",
     "history",
+    "bridge.check_update",
 })
 
 
@@ -2235,10 +2344,13 @@ def _cancel_dispatch_state() -> None:
 
 def _tick(dt: float) -> None:
     """Drain the work queue on the editor's main thread (if tick dispatch is active)."""
-    global _tick_health, _last_tick_mono
+    global _tick_health, _last_tick_mono, _reload_requested
     _tick_health += 1
     with _activity_lock:
         _last_tick_mono = time.monotonic()
+    if _reload_requested:
+        _reload_requested = False
+        _schedule_editor_callback(_reload_from_disk)
     _poll_pending_tool_calls()
     if _pending_tool_calls:
         return
@@ -2447,6 +2559,7 @@ def start(port: int = 0, mode: str = "auto") -> int:
 
     _log(f"Bridge v{VERSION} listening on http://127.0.0.1:{port}")
     _log(f"{len(_commands)} commands registered")
+    threading.Thread(target=_background_update_check, daemon=True).start()
     return port
 
 
