@@ -113,6 +113,10 @@ _work_queue: queue.Queue = queue.Queue()
 _results: Dict[str, Any] = {}
 _results_lock = threading.Lock()
 _pending_tool_calls: Dict[str, Any] = {}
+# Native calls whose caller's deadline passed while they were still running.
+# They keep the editor busy until they finish; watched for at most this long.
+_outlived_tool_calls: Dict[str, Any] = {}
+OUTLIVED_WATCH_S = 1800.0
 _abandoned_requests: set[str] = set()
 
 _log_lines: List[str] = []
@@ -331,10 +335,19 @@ class _PendingRegistryCall:
         self.command = ""
         self.started_mono = time.monotonic()
         self.deadline_mono = 0.0
+        self.expired = False
+
+    def still_running(self) -> bool:
+        """Whether the native call is still working (asked after its caller's deadline)."""
+        try:
+            return not bool(self.async_result.is_complete)
+        except Exception:
+            return False
 
     def poll(self) -> Optional[Any]:
         """Return a response/fallback when complete, otherwise None."""
         if self.deadline_mono and time.monotonic() >= self.deadline_mono:
+            self.expired = True
             return {
                 "ok": False,
                 "route": "toolset_registry",
@@ -2022,7 +2035,7 @@ def _editor_work_outstanding() -> bool:
     """True while the editor runs, owes or has queued a command, whoever is waiting for it."""
     with _activity_lock:
         running = _editor_command is not None
-    return running or bool(_pending_tool_calls) or not _work_queue.empty()
+    return running or bool(_pending_tool_calls) or bool(_outlived_tool_calls) or not _work_queue.empty()
 
 
 def _set_dispatch_turn(command: str = "") -> None:
@@ -2161,14 +2174,25 @@ def _poll_pending_tool_calls() -> None:
         if outcome is None:
             continue
         del _pending_tool_calls[rid]
-        if not _pending_tool_calls:
-            _set_editor_command()
+        if pending.expired and pending.still_running():
+            # The caller hears that it timed out; the native call goes on.
+            _outlived_tool_calls[rid] = pending
         if isinstance(outcome, _MCPFallback):
             outcome.command = pending.command
             outcome.started_mono = pending.started_mono
         else:
             _record_history(pending.command, pending.started_mono, outcome)
         _publish_result(rid, outcome)
+    now = time.monotonic()
+    for rid, call in list(_outlived_tool_calls.items()):
+        if not call.still_running() or now - call.started_mono > OUTLIVED_WATCH_S:
+            del _outlived_tool_calls[rid]
+    if not _pending_tool_calls:
+        if _outlived_tool_calls:
+            oldest = min(_outlived_tool_calls.values(), key=lambda call: call.started_mono)
+            _set_editor_command(oldest.command, "outlived_caller", oldest.started_mono)
+        else:
+            _set_editor_command()
 
 
 def _cancel_dispatch_state() -> None:
@@ -2197,6 +2221,7 @@ def _cancel_dispatch_state() -> None:
             ),
         }
     _pending_tool_calls.clear()
+    _outlived_tool_calls.clear()
     _set_editor_command()
     _tick_health = 0
 

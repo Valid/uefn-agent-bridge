@@ -232,6 +232,31 @@ class EditorActivityTests(unittest.TestCase):
         self.assertIsNone(after["editor_command"])
         self.assertLess(after["editor_tick_age_s"], 1.0)
 
+    def test_native_tool_that_outlives_its_deadline_stays_busy_until_it_finishes(self):
+        class NativeResult:
+            is_complete, error, value = False, "", "{}"
+
+        native = NativeResult()
+        call = server._PendingRegistryCall(native, "ValkyrieToolset.SessionToolset", "StartSession", {})
+        call.command, call.deadline_mono = "session.start", time.monotonic() - 1
+        server._pending_tool_calls["late-1"] = call
+        try:
+            server._poll_pending_tool_calls()
+            with server._results_lock:
+                answer = server._results.pop("late-1")
+            self.assertTrue(answer["outcome_unknown"], "the caller hears it timed out")
+            editor = server._activity_snapshot()["editor_command"]
+            self.assertEqual((editor["command"], editor["state"]), ("session.start", "outlived_caller"))
+            self.assertTrue(server._editor_work_outstanding())
+            native.is_complete = True
+            server._poll_pending_tool_calls()
+            self.assertIsNone(server._activity_snapshot()["editor_command"])
+            self.assertFalse(server._editor_work_outstanding())
+        finally:
+            server._pending_tool_calls.clear()
+            server._outlived_tool_calls.clear()
+            server._set_editor_command()
+
     def test_tick_age_grows_while_the_editor_does_not_tick(self):
         with mock.patch.object(server, "_last_tick_mono", time.monotonic() - 42.0):
             self.assertGreaterEqual(server._activity_snapshot()["editor_tick_age_s"], 42.0)
