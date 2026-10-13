@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
-[UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) lets your AI agent build in Unreal Editor for Fortnite for you. Claude Code, ChatGPT Codex or any script can place and wire devices, write and build Verse, and push to a live session, fast and safely enough to leave running unattended. Free and open source; join us on [Discord](https://discord.gg/fchq).
+**Give your AI agent all of UEFN, not half of it.** Epic's MCP reaches only the Fortnite tools Epic exposes, and Epic warns its calls can hang the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) puts both behind one local endpoint your agent can call from outside the editor, runs Epic's tools in-process instead of over MCP, and is built to run unattended. Free and open source; join us on [Discord](https://discord.gg/fchq).
 
 It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Python, so it works from any language. A stdlib-only Python client is included.
 
