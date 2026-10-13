@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import urllib.request
 from typing import Callable, Dict, List, Optional
@@ -34,6 +35,10 @@ _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _FILE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.py$")
 
 Fetch = Callable[[str, float], bytes]
+
+# One installation at a time: a manual update and a startup auto-update share
+# the staging names and the backup folder.
+_INSTALL_LOCK = threading.Lock()
 
 
 class UpdateError(RuntimeError):
@@ -153,6 +158,15 @@ def apply_update(
     checkout = find_git_checkout(bridge_dir)
     if checkout:
         raise UpdateError(f"this bridge runs from the git checkout {checkout}; update it with git pull")
+    if not _INSTALL_LOCK.acquire(blocking=False):
+        raise UpdateError("another bridge update is being installed; check status when it finishes")
+    try:
+        return _install(bridge_dir, current_version, fetch, allow_downgrade)
+    finally:
+        _INSTALL_LOCK.release()
+
+
+def _install(bridge_dir: str, current_version: str, fetch: Fetch, allow_downgrade: bool) -> dict:
     manifest = parse_manifest(fetch(RAW_BASE + MANIFEST_NAME, FETCH_TIMEOUT_S))
     latest = manifest["version"]
     if parse_version(latest) == parse_version(current_version):

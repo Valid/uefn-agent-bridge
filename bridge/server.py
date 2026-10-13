@@ -1654,6 +1654,17 @@ def _cmd_batch_exec(commands: List[dict], transaction: str = "") -> dict:
                     ),
                 })
                 continue
+            if name in _NETWORK_COMMANDS:
+                # A batch runs on the editor thread; downloads would freeze the editor.
+                results.append({
+                    "index": i,
+                    "success": False,
+                    "error": (
+                        f"'{name}' does network work and cannot run inside "
+                        "batch.exec. Call it separately."
+                    ),
+                })
+                continue
             try:
                 r = run_command(name, params)
                 results.append({"index": i, "success": True, "result": r})
@@ -2208,6 +2219,11 @@ _MCP_NETWORK_COMMANDS = frozenset({
     "mcp.list_toolsets",
     "mcp.describe_toolset",
     "mcp.call",
+})
+# Bridge commands that reach the network; they run on the HTTP thread only.
+_NETWORK_COMMANDS = frozenset({
+    "bridge.check_update",
+    "bridge.update",
 })
 _UNSERIALIZED_HTTP_COMMANDS = frozenset({
     "status",

@@ -158,6 +158,17 @@ class ApplyUpdateTests(unittest.TestCase):
         down = updates.apply_update(str(self.dir), "0.7.0", FakeRepository("0.6.0", self.NEW), allow_downgrade=True)
         self.assertTrue(down["updated"])
 
+    def test_a_second_concurrent_install_is_refused(self):
+        self.assertTrue(updates._INSTALL_LOCK.acquire(blocking=False))
+        try:
+            with self.assertRaises(updates.UpdateError) as caught:
+                updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
+        finally:
+            updates._INSTALL_LOCK.release()
+        self.assertIn("another bridge update", str(caught.exception))
+        self.assertEqual(self.read("server.py"), self.OLD["server.py"])
+        self.assertFalse((self.dir / updates.BACKUP_DIR_NAME).exists())
+
     def test_a_git_checkout_is_left_to_git(self):
         with mock.patch.object(updates, "find_git_checkout", return_value="/src/bridge-checkout"), \
                 self.assertRaises(updates.UpdateError) as caught:
@@ -263,6 +274,19 @@ class ServerIntegrationTests(unittest.TestCase):
             result = server._cmd_bridge_update(reload=False)
         self.assertFalse(result["reloading"])
         self.assertFalse(server._reload_requested)
+
+    def test_batch_refuses_network_commands_instead_of_running_them_on_the_editor_thread(self):
+        import contextlib
+
+        with mock.patch.object(server, "_cmd_bridge_update") as update, \
+                mock.patch.object(server, "_cmd_bridge_check_update") as check, \
+                mock.patch.object(server.unreal, "ScopedEditorTransaction",
+                                  lambda _name: contextlib.nullcontext(), create=True):
+            batch = server._cmd_batch_exec([{"command": "bridge.update"}, {"command": "bridge.check_update"}])
+        self.assertEqual([entry["success"] for entry in batch["results"]], [False, False])
+        self.assertTrue(all("network" in entry["error"] for entry in batch["results"]))
+        update.assert_not_called()
+        check.assert_not_called()
 
     def test_disabled_check_never_touches_the_network(self):
         with mock.patch.object(server.updates, "load_settings", return_value={"check_for_updates": False, "auto_update": False}), \
