@@ -9,7 +9,7 @@ Prerequisites:
     Copy the bridge/ folder into the same Content/Python/ directory so that
     `import bridge.server` resolves correctly.
 
-Docs: https://github.com/Valid/uefn-python-bridge
+Docs: https://github.com/Valid/uefn-agent-bridge
 """
 
 import unreal
@@ -28,7 +28,7 @@ def _boot_bridge() -> None:
         unreal.log_warning(
             "[Bridge] bridge/server.py not found.  "
             "Copy the bridge/ folder to Content/Python/ - "
-            "see https://github.com/Valid/uefn-python-bridge"
+            "see https://github.com/Valid/uefn-agent-bridge"
         )
     except Exception as exc:
         unreal.log_error(f"[Bridge] Auto-start failed: {exc}")

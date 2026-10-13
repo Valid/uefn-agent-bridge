@@ -1,4 +1,4 @@
-"""Example: Material creation via the UEFN Python Bridge.
+"""Example: Material creation via the UEFN Agent Bridge.
 
     python examples/materials.py
 """

@@ -1,4 +1,4 @@
-# UEFN Hybrid Python Bridge - LLM Rules File
+# UEFN Agent Bridge - LLM Rules File
 
 > Drop this file into your AI tool's context to generate working UEFN Python
 > scripts and safe hybrid tool calls. Works with any LLM, including Claude,
@@ -16,7 +16,7 @@ UEFN (Unreal Editor for Fortnite) embeds Python 3.11 for **editor automation**.
 Python controls the editor: placing actors, managing assets, creating materials,
 batch processing, pipeline tooling.  **Gameplay logic uses Verse, not Python.**
 
-The **UEFN Hybrid Python Bridge** runs an HTTP server inside the editor so
+The **UEFN Agent Bridge** runs an HTTP server inside the editor so
 external tools can send commands. You can also write scripts that run directly
 inside UEFN via `Tools > Execute Python Script`.
 

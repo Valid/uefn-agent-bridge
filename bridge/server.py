@@ -1,4 +1,4 @@
-"""UEFN Python Bridge - HTTP server that runs inside the UEFN editor.
+"""UEFN Agent Bridge - HTTP server that runs inside the UEFN editor.
 
 Provides a local REST API so external tools (AI agents, scripts, CI pipelines)
 can execute Python inside the editor.  All `unreal.*` calls are routed to the
@@ -10,7 +10,7 @@ Start manually:
 Or auto-start:
     Copy bridge/ folder + startup.py to <Project>/Content/Python/
 
-Docs & source: https://github.com/Valid/uefn-python-bridge
+Docs & source: https://github.com/Valid/uefn-agent-bridge
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -1816,7 +1816,10 @@ class _Handler(BaseHTTPRequestHandler):
             }).encode())
             return
         body = json.dumps({
+            # Clients identify the bridge by this field; it keeps the original
+            # project name so existing tools still find it.
             "bridge": "uefn-python-bridge",
+            "name": "uefn-agent-bridge",
             "version": VERSION,
             "port": _active_port,
             "commands": sorted(_commands),

@@ -162,6 +162,8 @@ class BusyTests(_LiveHandlerTestCase):
             body = json.loads(response.read())
         self.assertIn("activity", body)
         self.assertIn("editor_tick_age_s", body["activity"])
+        # Clients find the bridge by this identity field, so it keeps the original name.
+        self.assertEqual((body["bridge"], body["name"]), ("uefn-python-bridge", "uefn-agent-bridge"))
 
     def test_client_raises_bridge_busy(self):
         client = UEFNBridge(port=self.port, timeout=5)

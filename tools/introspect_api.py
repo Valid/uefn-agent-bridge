@@ -8,7 +8,7 @@ This captures every class, enum, struct, and function exposed by the
 `unreal` module so you can generate stubs, documentation, or capability
 reports for your specific UEFN version.
 
-Docs: https://github.com/Valid/uefn-python-bridge
+Docs: https://github.com/Valid/uefn-agent-bridge
 """
 
 import json

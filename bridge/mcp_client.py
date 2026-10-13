@@ -443,7 +443,7 @@ class UnrealMCPClient:
         *,
         timeout: float = 30.0,
         allow_remote: bool = False,
-        client_name: str = "uefn-python-bridge",
+        client_name: str = "uefn-agent-bridge",
         client_version: str = "0.3.0",
     ) -> None:
         if not isinstance(timeout, (int, float)):

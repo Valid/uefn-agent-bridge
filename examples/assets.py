@@ -1,4 +1,4 @@
-"""Example: Asset management via the UEFN Python Bridge.
+"""Example: Asset management via the UEFN Agent Bridge.
 
     python examples/assets.py
 """

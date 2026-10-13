@@ -1,4 +1,4 @@
-"""Example: Working with actors via the UEFN Python Bridge.
+"""Example: Working with actors via the UEFN Agent Bridge.
 
 Run from your local machine (outside UEFN) with the bridge server running.
 
