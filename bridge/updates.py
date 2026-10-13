@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import urllib.request
@@ -37,8 +38,15 @@ _FILE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.py$")
 Fetch = Callable[[str, float], bytes]
 
 # One installation at a time: a manual update and a startup auto-update share
-# the staging names and the backup folder.
-_INSTALL_LOCK = threading.Lock()
+# the staging names and the backup folder. The lock is kept on the sys module,
+# so a reload, which imports a fresh copy of this module, still uses the same
+# lock as an install that an older copy started.
+_INSTALL_LOCK = sys.__dict__.setdefault("_uefn_bridge_install_lock", threading.Lock())
+
+
+def install_in_progress() -> bool:
+    """True while any copy of this module is installing bridge files."""
+    return _INSTALL_LOCK.locked()
 
 
 class UpdateError(RuntimeError):

@@ -930,6 +930,8 @@ def _cmd_reload() -> dict:
     script_path = _SCRIPT_PATH
     if not script_path or not os.path.isfile(script_path):
         return {"error": f"Cannot find script path (got: {script_path!r}). Restart manually."}
+    if updates.install_in_progress():
+        raise RuntimeError("A bridge update is being installed; reload when it finishes.")
     _schedule_editor_callback(_reload_from_disk)
     return {"message": f"Reloading from {script_path}..."}
 
@@ -2381,10 +2383,14 @@ def _tick(dt: float) -> None:
         _last_tick_mono = time.monotonic()
     # A requested reload waits until nothing is running, queued or pending on a
     # native tool, and takes the dispatch turn so nothing starts before it.
+    # An install in progress (from any server generation) is waited for, so a
+    # reload never reads files that are being swapped.
     if (
         _reload_requested
         and not _pending_tool_calls
+        and not _outlived_tool_calls
         and _work_queue.empty()
+        and not updates.install_in_progress()
         and _request_serial_lock.acquire(blocking=False)
     ):
         _reload_requested = False

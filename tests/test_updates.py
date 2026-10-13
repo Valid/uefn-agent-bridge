@@ -189,6 +189,19 @@ class ApplyUpdateTests(unittest.TestCase):
         self.assertEqual(self.read("server.py"), self.OLD["server.py"])
         self.assertFalse((self.dir / updates.BACKUP_DIR_NAME).exists())
 
+    def test_a_reloaded_copy_of_the_module_shares_the_install_lock(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("updates_after_reload", REPO / "bridge" / "updates.py")
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        self.assertIs(fresh._INSTALL_LOCK, updates._INSTALL_LOCK)
+        with updates._INSTALL_LOCK:
+            self.assertTrue(fresh.install_in_progress())
+            with self.assertRaises(fresh.UpdateError):
+                fresh.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
+        self.assertFalse(fresh.install_in_progress())
+
     def test_a_git_checkout_is_left_to_git(self):
         with mock.patch.object(updates, "find_git_checkout", return_value="/src/bridge-checkout"), \
                 self.assertRaises(updates.UpdateError) as caught:
@@ -322,6 +335,23 @@ class ServerIntegrationTests(unittest.TestCase):
             self.assertEqual(self.ticks(), [])
         finally:
             server._request_serial_lock.release()
+        scheduled = self.ticks()
+        self.assertEqual(len(scheduled), 1)
+        server._request_serial_lock.release()
+
+    def test_reload_waits_for_an_install_and_a_native_tool_past_its_deadline(self):
+        self.request_update()
+        with updates._INSTALL_LOCK:
+            self.assertEqual(self.ticks(), [], "no reload while files are being swapped")
+            with self.assertRaises(RuntimeError):
+                server._cmd_reload()
+        server._outlived_tool_calls["late-1"] = mock.Mock(still_running=lambda: True, started_mono=0.0, command="session.start")
+        try:
+            with mock.patch.object(server, "OUTLIVED_WATCH_S", 1e12):
+                self.assertEqual(self.ticks(), [], "no reload while a native tool still runs")
+        finally:
+            server._outlived_tool_calls.clear()
+            server._set_editor_command()
         scheduled = self.ticks()
         self.assertEqual(len(scheduled), 1)
         server._request_serial_lock.release()
