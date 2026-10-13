@@ -76,7 +76,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.3.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.3.1 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 90 commands registered
 ```
 
@@ -192,13 +192,15 @@ These commands always use the embedded-Python route.
 |---|---|---|
 | `actors.list` | List level actors | `class_filter` |
 | `actors.selected` | List selected actors | None |
-| `actors.spawn` | Spawn from a class or asset | `actor_class` or `asset_path`, `location`, `label` |
-| `actors.duplicate` | Clone an actor | `source`, `location`, `label` |
-| `actors.delete` | Delete actors | `targets` |
+| `actors.spawn` | Spawn from a class or asset | `actor_class` or `asset_path`, `location`, `rotation`, `label` |
+| `actors.duplicate` | Clone an actor | `source`, `location`, `rotation`, `label` |
+| `actors.delete` | Delete actors; reports each target it could not delete under `failed` | `targets` |
 | `actors.transform` | Set location, rotation, or scale | `target`, `location`, `rotation`, `scale` |
 | `actors.properties` | Read named editable properties | `target`, `properties` |
 | `actors.set_property` | Set an editor property | `target`, `property_name`, `value` |
 | `actors.set_color` | Create and apply a persistent solid-color material | `target`, `color` |
+
+Locations and scales are `[x, y, z]`. Rotations are `[pitch, yaw, roll]` in degrees, or an object such as `{"pitch": 0, "yaw": 90, "roll": 0}` (the shape responses return), for `actors.spawn`, `actors.duplicate`, `actors.transform` and `viewport.set_camera`.
 
 ### Assets
 

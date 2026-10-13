@@ -95,7 +95,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -185,6 +185,28 @@ def to_json_safe(obj: Any) -> Any:
         return str(obj)
     except Exception:
         return repr(obj)
+
+
+def _rotator(value: Any) -> unreal.Rotator:
+    """Build a rotation from the bridge's wire format.
+
+    Rotations arrive as ``[pitch, yaw, roll]`` in degrees, or as the
+    ``{"pitch", "yaw", "roll"}`` object that responses return. The positional
+    order of ``unreal.Rotator`` is (roll, pitch, yaw), so it is only ever
+    constructed by keyword here.
+    """
+    if isinstance(value, dict):
+        unknown = sorted(set(value) - {"pitch", "yaw", "roll"})
+        if unknown:
+            raise ValueError(f"rotation has unknown keys {unknown}; expected pitch, yaw, roll")
+        pitch, yaw, roll = (float(value.get(key, 0.0)) for key in ("pitch", "yaw", "roll"))
+    elif isinstance(value, (list, tuple)) and len(value) == 3:
+        pitch, yaw, roll = (float(component) for component in value)
+    else:
+        raise ValueError(
+            'rotation must be [pitch, yaw, roll] or {"pitch": ..., "yaw": ..., "roll": ...}'
+        )
+    return unreal.Rotator(roll=roll, pitch=pitch, yaw=yaw)
 
 
 def actor_summary(actor: unreal.Actor) -> dict:
@@ -892,7 +914,7 @@ def _cmd_actors_spawn(
 ) -> dict:
     def _do():
         loc = unreal.Vector(*(location or [0, 0, 0]))
-        rot = unreal.Rotator(*(rotation or [0, 0, 0]))
+        rot = _rotator(rotation if rotation is not None else [0, 0, 0])
         actor = None
         # Accept class_name as alias for actor_class
         cls_name = actor_class or class_name
@@ -939,7 +961,7 @@ def _cmd_actors_duplicate(
         if location:
             dup.set_actor_location(unreal.Vector(*location), False, False)
         if rotation:
-            dup.set_actor_rotation(unreal.Rotator(*rotation), False)
+            dup.set_actor_rotation(_rotator(rotation), False)
         if label:
             dup.set_actor_label(label)
         return {"actor": actor_summary(dup)}
@@ -954,14 +976,21 @@ def _cmd_actors_delete(targets: List[str], transaction: str = "") -> dict:
     with unreal.ScopedEditorTransaction(txn):
         sub = _get_actor_sub()
         all_actors = sub.get_all_level_actors()
-        removed = []
+        removed: List[str] = []
+        failed: List[dict] = []
         for t in targets:
-            for a in all_actors:
-                if a.get_path_name() == t or a.get_actor_label() == t:
-                    sub.destroy_actor(a)
-                    removed.append(t)
-                    break
-    return {"deleted": removed, "count": len(removed)}
+            actor = next(
+                (a for a in all_actors if a.get_path_name() == t or a.get_actor_label() == t),
+                None,
+            )
+            if actor is None:
+                failed.append({"target": t, "reason": "not found"})
+            elif sub.destroy_actor(actor):
+                removed.append(t)
+            else:
+                # destroy_actor reports failure by return value, not by raising.
+                failed.append({"target": t, "reason": "destroy_actor returned False"})
+    return {"deleted": removed, "count": len(removed), "failed": failed}
 
 
 @command("actors.transform")
@@ -978,7 +1007,7 @@ def _cmd_actors_transform(
         if location is not None:
             actor.set_actor_location(unreal.Vector(*location), False, False)
         if rotation is not None:
-            actor.set_actor_rotation(unreal.Rotator(*rotation), False)
+            actor.set_actor_rotation(_rotator(rotation), False)
         if scale is not None:
             actor.set_actor_scale3d(unreal.Vector(*scale))
     return {"actor": actor_summary(actor)}
@@ -1213,7 +1242,7 @@ def _cmd_viewport_set_camera(
 ) -> dict:
     cur_loc, cur_rot = unreal.EditorLevelLibrary.get_level_viewport_camera_info()
     loc = unreal.Vector(*location) if location else cur_loc
-    rot = unreal.Rotator(*rotation) if rotation else cur_rot
+    rot = _rotator(rotation) if rotation else cur_rot
     unreal.EditorLevelLibrary.set_level_viewport_camera_info(loc, rot)
     return {"location": to_json_safe(loc), "rotation": to_json_safe(rot)}
 
