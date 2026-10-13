@@ -1783,8 +1783,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if if_busy == "reject":
-            # Fail fast instead of queueing: nothing was started.
-            if not _request_serial_lock.acquire(blocking=False):
+            # Fail fast instead of queueing: nothing was started. A command whose
+            # caller timed out can still occupy the editor after releasing the
+            # turn, so outstanding editor work counts as busy too.
+            acquired = _request_serial_lock.acquire(blocking=False)
+            if not acquired or _editor_work_outstanding():
+                if acquired:
+                    _request_serial_lock.release()
                 self._respond(409, json.dumps({
                     "ok": False,
                     "route": _command_route(cmd),
@@ -2011,6 +2016,13 @@ def _set_editor_command(command: str = "", state: str = "running", since: float 
             {"command": command, "state": state, "since": since or time.monotonic()}
             if command else None
         )
+
+
+def _editor_work_outstanding() -> bool:
+    """True while the editor runs, owes or has queued a command, whoever is waiting for it."""
+    with _activity_lock:
+        running = _editor_command is not None
+    return running or bool(_pending_tool_calls) or not _work_queue.empty()
 
 
 def _set_dispatch_turn(command: str = "") -> None:

@@ -140,7 +140,7 @@ The bridge serves one editor command at a time; other requests wait their turn. 
 
 - `editor_command` is the command running on the editor thread (`state` is `running`, or `waiting_on_tool` while a native tool works), and `dispatch_turn` is the request being served. `waiting` counts the requests queued behind it.
 - `editor_tick_age_s` is the time since the editor last ran the bridge's tick. It grows while the editor's game thread is blocked. A large value with `editor_command` set means a bridge command is slow; with `editor_command` empty, something outside the bridge holds the editor, such as a modal dialog.
-- Add `"if_busy": "reject"` to a request to fail fast instead of queueing. A busy bridge answers HTTP 409 with `busy` (the same `activity` object) and starts nothing. The Python client raises `BridgeBusy`.
+- Add `"if_busy": "reject"` to a request to fail fast instead of queueing. A busy bridge answers HTTP 409 with `busy` (the same `activity` object) and starts nothing. Busy includes editor work whose own caller already timed out. The Python client raises `BridgeBusy`.
 - Without `timeout_s`, a request's deadline is 30 seconds, except for tools that routinely take longer: `session.start`, `session.push_changes` and `verse.build` get 600 seconds, `session.stop` and `session.start_game` 180, and `session.stop_game` 120. The same applies to `toolsets.call` and `mcp.call` naming those tools. The Python client waits at least as long.
 
 ### Python Client

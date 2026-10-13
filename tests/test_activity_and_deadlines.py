@@ -114,6 +114,20 @@ class BusyTests(_LiveHandlerTestCase):
         self.assertEqual(body["busy"]["dispatch_turn"]["command"], "verse.build")
         self.assertTrue(server._work_queue.empty(), "a rejected request must not be queued")
 
+    def test_reject_counts_editor_work_whose_caller_timed_out(self):
+        # The turn is free, but the editor is still running an abandoned command.
+        server._set_editor_command("exec")
+        status, body = self.post({"command": "actors.list", "if_busy": "reject"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["busy"]["editor_command"]["command"], "exec")
+        server._set_editor_command()
+        server._work_queue.put(("abandoned-1", "exec", {}, time.monotonic() + 5))
+        status, _ = self.post({"command": "actors.list", "if_busy": "reject"})
+        self.assertEqual(status, 409)
+        self.assertEqual(server._work_queue.qsize(), 1, "nothing new was queued")
+        self.assertTrue(server._request_serial_lock.acquire(blocking=False), "the turn was released")
+        server._request_serial_lock.release()
+
     def test_reject_on_an_idle_bridge_dispatches_normally(self):
         status, body = self.post({"command": "status", "if_busy": "reject"})
         self.assertEqual((status, body["ok"]), (200, True))
