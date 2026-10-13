@@ -70,6 +70,7 @@ try:
     from .routes import (
         TOOLSET_ROUTES,
         UEFN_EXPOSED_TOOLSETS,
+        default_deadline_s,
         is_tool_allowed,
         short_tool_name,
     )
@@ -79,6 +80,7 @@ except ImportError:
     from routes import (  # type: ignore
         TOOLSET_ROUTES,
         UEFN_EXPOSED_TOOLSETS,
+        default_deadline_s,
         is_tool_allowed,
         short_tool_name,
     )
@@ -95,7 +97,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -111,6 +113,10 @@ _work_queue: queue.Queue = queue.Queue()
 _results: Dict[str, Any] = {}
 _results_lock = threading.Lock()
 _pending_tool_calls: Dict[str, Any] = {}
+# Native calls whose caller's deadline passed while they were still running.
+# They keep the editor busy until they finish; watched for at most this long.
+_outlived_tool_calls: Dict[str, Any] = {}
+OUTLIVED_WATCH_S = 1800.0
 _abandoned_requests: set[str] = set()
 
 _log_lines: List[str] = []
@@ -235,6 +241,14 @@ def command(name: str):
     return _wrap
 
 
+class _CommandFailed(RuntimeError):
+    """A command failure that carries extra fields for the response envelope."""
+
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.fields = fields
+
+
 def run_command(name: str, params: dict) -> dict:
     """Look up and execute a registered command (must be called on main thread)."""
     fn = _commands.get(name)
@@ -321,10 +335,19 @@ class _PendingRegistryCall:
         self.command = ""
         self.started_mono = time.monotonic()
         self.deadline_mono = 0.0
+        self.expired = False
+
+    def still_running(self) -> bool:
+        """Whether the native call is still working (asked after its caller's deadline)."""
+        try:
+            return not bool(self.async_result.is_complete)
+        except Exception:
+            return False
 
     def poll(self) -> Optional[Any]:
         """Return a response/fallback when complete, otherwise None."""
         if self.deadline_mono and time.monotonic() >= self.deadline_mono:
+            self.expired = True
             return {
                 "ok": False,
                 "route": "toolset_registry",
@@ -787,6 +810,7 @@ def _cmd_status() -> dict:
         "port": _active_port,
         "uptime_s": round(time.monotonic() - _start_mono, 1) if _start_mono else 0,
         "commands": sorted(_commands),
+        "activity": _activity_snapshot(),
         "routing": {
             "strategy": ["python", "toolset_registry", "mcp"],
             "toolset_aliases": sorted(TOOLSET_ROUTES),
@@ -805,6 +829,10 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
     ``unreal.ScopedEditorTransaction`` so the entire operation is a single
     undo entry in the editor. The namespace includes ``clip_get``, ``clip_set``,
     ``export_t3d``, ``t3d_parse``, and ``find_actor`` for Verse device edits.
+
+    If the code raises, the command fails (``ok: false``) and the response
+    still carries ``result``, ``stdout`` and ``stderr``. Changes the code made
+    before the exception are not rolled back.
     """
     out, err = io.StringIO(), io.StringIO()
     old_out, old_err = sys.stdout, sys.stderr
@@ -820,6 +848,8 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
         except Exception:
             pass
     ns.update({"clip_get": _clip_get, "clip_set": _clip_set, "export_t3d": _export_t3d_impl, "t3d_parse": _t3d_parse, "find_actor": _find_actor})
+    raised: Optional[BaseException] = None
+    script_traceback = ""
     try:
         sys.stdout, sys.stderr = out, err
         if transaction:
@@ -827,15 +857,24 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
                 exec(code, ns)
         else:
             exec(code, ns)
-    except Exception:
-        traceback.print_exc(file=err)
+    except Exception as exc:
+        raised = exc
+        script_traceback = traceback.format_exc()
+        err.write(script_traceback)
     finally:
         sys.stdout, sys.stderr = old_out, old_err
-    return {
+    output = {
         "result": to_json_safe(ns.get("result")),
         "stdout": out.getvalue(),
         "stderr": err.getvalue(),
     }
+    if raised is not None:
+        raise _CommandFailed(
+            f"exec raised {type(raised).__name__}: {raised}",
+            traceback=script_traceback,
+            **output,
+        )
+    return output
 
 
 @command("log")
@@ -1514,7 +1553,12 @@ def _cmd_batch_exec(commands: List[dict], transaction: str = "") -> dict:
                 r = run_command(name, params)
                 results.append({"index": i, "success": True, "result": r})
             except Exception as exc:
-                results.append({"index": i, "success": False, "error": str(exc)})
+                failure = {"index": i, "success": False, "error": str(exc)}
+                failure.update({
+                    key: value for key, value in getattr(exc, "fields", {}).items()
+                    if key not in failure
+                })
+                results.append(failure)
     return {"results": results, "count": len(results)}
 
 
@@ -1644,6 +1688,7 @@ class _Handler(BaseHTTPRequestHandler):
             "version": VERSION,
             "port": _active_port,
             "commands": sorted(_commands),
+            "activity": _activity_snapshot(),
         }).encode()
         self._respond(200, body)
 
@@ -1714,10 +1759,7 @@ class _Handler(BaseHTTPRequestHandler):
         cmd = payload.get("command", "")
         params = payload.get("params", {})
         timeout_s = payload.get("timeout_s")
-        request_timeout_s = (
-            max(1.0, min(600.0, float(timeout_s)))
-            if isinstance(timeout_s, (int, float)) else REQUEST_TIMEOUT_S
-        )
+        if_busy = payload.get("if_busy", "wait")
         if not isinstance(cmd, str) or not cmd:
             self._respond(400, json.dumps({
                 "ok": False,
@@ -1727,6 +1769,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(params, dict):
             self._respond(400, json.dumps({"ok": False, "error": "'params' must be an object"}).encode())
             return
+        if if_busy not in ("wait", "reject"):
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "'if_busy' must be 'wait' or 'reject'",
+            }).encode())
+            return
+        # Without an explicit timeout_s, slow native tools (session start, push,
+        # Verse build) get a deadline that fits them; everything else gets 30 s.
+        request_timeout_s = (
+            max(1.0, min(600.0, float(timeout_s)))
+            if isinstance(timeout_s, (int, float))
+            else default_deadline_s(cmd, params, REQUEST_TIMEOUT_S)
+        )
 
         rid = uuid.uuid4().hex
         deadline = time.monotonic() + request_timeout_s
@@ -1740,14 +1795,31 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, json.dumps(resp).encode())
             return
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not _request_serial_lock.acquire(timeout=remaining):
-            self._respond(200, json.dumps({
-                "ok": False,
-                "route": _command_route(cmd),
-                "error": f"'{cmd}' expired before serialized dispatch",
-            }).encode())
-            return
+        if if_busy == "reject":
+            # Fail fast instead of queueing: nothing was started. A command whose
+            # caller timed out can still occupy the editor after releasing the
+            # turn, so outstanding editor work counts as busy too.
+            acquired = _request_serial_lock.acquire(blocking=False)
+            if not acquired or _editor_work_outstanding():
+                if acquired:
+                    _request_serial_lock.release()
+                self._respond(409, json.dumps({
+                    "ok": False,
+                    "route": _command_route(cmd),
+                    "busy": _activity_snapshot(),
+                    "error": f"'{cmd}' was not started because the bridge is busy",
+                }).encode())
+                return
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not _wait_for_turn(remaining):
+                self._respond(200, json.dumps({
+                    "ok": False,
+                    "route": _command_route(cmd),
+                    "error": f"'{cmd}' expired before serialized dispatch",
+                }).encode())
+                return
+        _set_dispatch_turn(cmd)
         try:
             if not self._reserve_dispatch():
                 status, resp = 503, {
@@ -1759,6 +1831,7 @@ class _Handler(BaseHTTPRequestHandler):
                     rid, cmd, params, deadline, request_timeout_s
                 )
         finally:
+            _set_dispatch_turn()
             _request_serial_lock.release()
         try:
             self._respond(status, json.dumps(resp).encode())
@@ -1941,6 +2014,75 @@ _start_mono: float = 0
 _dispatch_mode: str = "tick"
 _tick_health: int = 0           # incremented by tick callback
 
+# What the bridge is doing, readable from HTTP threads while a command runs.
+_activity_lock = threading.Lock()
+_last_tick_mono: float = 0.0          # when the editor last ran _tick
+_editor_command: Optional[dict] = None   # {"command", "state", "since"} on the editor thread
+_dispatch_turn: Optional[dict] = None    # {"command", "since"}: the request whose turn it is
+_waiting_requests: int = 0            # requests queued behind that turn
+
+
+def _set_editor_command(command: str = "", state: str = "running", since: float = 0.0) -> None:
+    global _editor_command
+    with _activity_lock:
+        _editor_command = (
+            {"command": command, "state": state, "since": since or time.monotonic()}
+            if command else None
+        )
+
+
+def _editor_work_outstanding() -> bool:
+    """True while the editor runs, owes or has queued a command, whoever is waiting for it."""
+    with _activity_lock:
+        running = _editor_command is not None
+    return running or bool(_pending_tool_calls) or bool(_outlived_tool_calls) or not _work_queue.empty()
+
+
+def _set_dispatch_turn(command: str = "") -> None:
+    global _dispatch_turn
+    with _activity_lock:
+        _dispatch_turn = {"command": command, "since": time.monotonic()} if command else None
+
+
+def _wait_for_turn(timeout_s: float) -> bool:
+    """Wait for the one-at-a-time dispatch turn, counted in ``waiting``."""
+    global _waiting_requests
+    with _activity_lock:
+        _waiting_requests += 1
+    try:
+        return _request_serial_lock.acquire(timeout=timeout_s)
+    finally:
+        with _activity_lock:
+            _waiting_requests -= 1
+
+
+def _activity_snapshot() -> dict:
+    """Report busy versus stalled without waiting for the editor.
+
+    ``editor_tick_age_s`` grows while the editor's game thread is blocked. If
+    ``editor_command`` is set, a bridge command is the reason; if it is empty,
+    something outside the bridge holds the editor (a modal dialog, a build,
+    a hang). ``dispatch_turn`` is the request being served one at a time, and
+    ``waiting`` counts the requests queued behind it.
+    """
+    now = time.monotonic()
+    with _activity_lock:
+        editor = dict(_editor_command) if _editor_command else None
+        turn = dict(_dispatch_turn) if _dispatch_turn else None
+        waiting = _waiting_requests
+        last_tick = _last_tick_mono
+    if editor:
+        editor = {"command": editor["command"], "state": editor["state"],
+                  "seconds": round(now - editor["since"], 1)}
+    if turn:
+        turn = {"command": turn["command"], "seconds": round(now - turn["since"], 1)}
+    return {
+        "editor_command": editor,
+        "dispatch_turn": turn,
+        "waiting": waiting,
+        "editor_tick_age_s": round(now - last_tick, 2) if last_tick else None,
+    }
+
 # Commands that are safe on the HTTP worker because they make no unreal calls.
 _HTTP_THREAD_COMMANDS = frozenset({
     "status",
@@ -2009,6 +2151,10 @@ def _execute_and_respond(rid: str, cmd: str, params: dict) -> Any:
         }
         if getattr(exc, "outcome_unknown", False):
             resp["outcome_unknown"] = True
+        resp.update({
+            key: value for key, value in getattr(exc, "fields", {}).items()
+            if key not in ("ok", "route", "error")
+        })
     _record_history(cmd, t0, resp)
     return resp
 
@@ -2028,12 +2174,25 @@ def _poll_pending_tool_calls() -> None:
         if outcome is None:
             continue
         del _pending_tool_calls[rid]
+        if pending.expired and pending.still_running():
+            # The caller hears that it timed out; the native call goes on.
+            _outlived_tool_calls[rid] = pending
         if isinstance(outcome, _MCPFallback):
             outcome.command = pending.command
             outcome.started_mono = pending.started_mono
         else:
             _record_history(pending.command, pending.started_mono, outcome)
         _publish_result(rid, outcome)
+    now = time.monotonic()
+    for rid, call in list(_outlived_tool_calls.items()):
+        if not call.still_running() or now - call.started_mono > OUTLIVED_WATCH_S:
+            del _outlived_tool_calls[rid]
+    if not _pending_tool_calls:
+        if _outlived_tool_calls:
+            oldest = min(_outlived_tool_calls.values(), key=lambda call: call.started_mono)
+            _set_editor_command(oldest.command, "outlived_caller", oldest.started_mono)
+        else:
+            _set_editor_command()
 
 
 def _cancel_dispatch_state() -> None:
@@ -2062,6 +2221,8 @@ def _cancel_dispatch_state() -> None:
             ),
         }
     _pending_tool_calls.clear()
+    _outlived_tool_calls.clear()
+    _set_editor_command()
     _tick_health = 0
 
     with _results_lock:
@@ -2074,8 +2235,10 @@ def _cancel_dispatch_state() -> None:
 
 def _tick(dt: float) -> None:
     """Drain the work queue on the editor's main thread (if tick dispatch is active)."""
-    global _tick_health
+    global _tick_health, _last_tick_mono
     _tick_health += 1
+    with _activity_lock:
+        _last_tick_mono = time.monotonic()
     _poll_pending_tool_calls()
     if _pending_tool_calls:
         return
@@ -2098,10 +2261,15 @@ def _tick(dt: float) -> None:
             })
             done += 1
             continue
-        response = _execute_and_respond(rid, cmd, params)
+        _set_editor_command(cmd)
+        try:
+            response = _execute_and_respond(rid, cmd, params)
+        finally:
+            _set_editor_command()
         if isinstance(response, _PendingRegistryCall):
             response.deadline_mono = deadline
             _pending_tool_calls[rid] = response
+            _set_editor_command(cmd, "waiting_on_tool", response.started_mono)
             done += 1
             break
         else:

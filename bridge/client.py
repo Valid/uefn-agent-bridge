@@ -23,24 +23,40 @@ import urllib.request
 from typing import Any, Optional
 
 try:
-    from .routes import PYTHON_COMMANDS, TOOLSET_ROUTES
+    from .routes import PYTHON_COMMANDS, TOOLSET_ROUTES, default_deadline_s
 except ImportError:
-    from routes import PYTHON_COMMANDS, TOOLSET_ROUTES
+    from routes import PYTHON_COMMANDS, TOOLSET_ROUTES, default_deadline_s
 
 
 class BridgeError(Exception):
-    """Raised when a bridge command fails."""
+    """Raised when a bridge command fails.
+
+    ``envelope`` is the complete failure response when the bridge sent one,
+    for example the ``stdout`` and ``stderr`` of an ``exec`` that raised.
+    """
     def __init__(
         self,
         message: str,
         traceback_text: str = "",
         route: str = "",
         outcome_unknown: bool = False,
+        envelope: Optional[dict] = None,
     ):
         super().__init__(message)
         self.traceback_text = traceback_text
         self.route = route
         self.outcome_unknown = outcome_unknown
+        self.envelope = envelope or {}
+
+
+class BridgeBusy(BridgeError):
+    """The bridge was busy and the request asked not to wait (``if_busy="reject"``).
+
+    Nothing was started. ``busy`` describes what the bridge is doing.
+    """
+    def __init__(self, message: str, busy: dict, route: str = "", envelope: Optional[dict] = None):
+        super().__init__(message, route=route, envelope=envelope)
+        self.busy = busy
 
 
 class ConnectionFailed(BridgeError):
@@ -100,11 +116,15 @@ class UEFNBridge:
             ) or exc.code >= 500 or malformed_error
             traceback_text = payload.get("traceback", "")
             route = payload.get("route", "")
+            route = route if isinstance(route, str) else ""
+            if exc.code == 409 and isinstance(payload.get("busy"), dict) and not malformed_error:
+                raise BridgeBusy(message, payload["busy"], route, payload) from exc
             raise BridgeError(
                 message,
                 traceback_text if isinstance(traceback_text, str) else "",
-                route if isinstance(route, str) else "",
+                route,
                 outcome_unknown,
+                payload,
             ) from exc
         except BridgeError:
             raise
@@ -129,12 +149,28 @@ class UEFNBridge:
                 outcome_unknown=True,
             ) from exc
 
-    def request(self, command: str, *, timeout_s: float = 0, **params: Any) -> dict:
-        """Execute a command and return the complete response envelope."""
-        payload = {"command": command, "params": params}
+    def request(
+        self,
+        command: str,
+        *,
+        timeout_s: float = 0,
+        if_busy: str = "wait",
+        **params: Any,
+    ) -> dict:
+        """Execute a command and return the complete response envelope.
+
+        ``if_busy="reject"`` returns at once with :class:`BridgeBusy` instead of
+        queueing behind a running command. Without ``timeout_s`` the bridge
+        applies its own deadline (longer for session, push and build tools),
+        and the client waits at least that long.
+        """
+        payload: dict = {"command": command, "params": params}
         if timeout_s > 0:
             payload["timeout_s"] = timeout_s
-        response_timeout = max(self.timeout, timeout_s + 5) if timeout_s > 0 else 0
+        if if_busy != "wait":
+            payload["if_busy"] = if_busy
+        deadline = timeout_s if timeout_s > 0 else default_deadline_s(command, params, 0)
+        response_timeout = max(self.timeout, deadline + 5) if deadline > 0 else 0
         resp = self._post(payload, response_timeout)
         if not isinstance(resp, dict):
             raise BridgeError(
@@ -169,15 +205,16 @@ class UEFNBridge:
                 route,
                 bool(resp.get("outcome_unknown"))
                 or "may still complete" in message.lower(),
+                resp,
             )
         return resp
 
-    def run(self, command: str, *, timeout_s: float = 0, **params: Any) -> Any:
+    def run(self, command: str, *, timeout_s: float = 0, if_busy: str = "wait", **params: Any) -> Any:
         """Execute a named bridge command with keyword params.
 
         Returns the 'result' dict on success; raises BridgeError on failure.
         """
-        return self.request(command, timeout_s=timeout_s, **params).get("result")
+        return self.request(command, timeout_s=timeout_s, if_busy=if_busy, **params).get("result")
 
     @property
     def last_route(self) -> str:
@@ -196,7 +233,11 @@ class UEFNBridge:
         return "python"
 
     def exec(self, code: str, timeout_s: float = 0) -> dict:
-        """Run arbitrary Python code inside UEFN.  Returns {result, stdout, stderr}."""
+        """Run arbitrary Python code inside UEFN.  Returns {result, stdout, stderr}.
+
+        If the code raises, this raises BridgeError; its ``envelope`` still has
+        ``stdout`` and ``stderr``.
+        """
         return self.run("exec", code=code, timeout_s=timeout_s)
 
     def status(self) -> dict:
