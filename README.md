@@ -2,20 +2,22 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
-**Give your AI agent all of UEFN, not half of it.** Epic's MCP reaches only the Fortnite tools Epic exposes, and Epic warns its calls can hang the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) puts both behind one local endpoint your agent can call from outside the editor, runs Epic's tools in-process instead of over MCP, and is built to run unattended. Free and open source; join us on [Discord](https://discord.gg/fchq).
+**Give your AI agent all of UEFN, not half of it.** Epic's MCP is slow, reaches only the Fortnite tools Epic exposes, and by Epic's own notes can stall the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) puts both behind one fast local endpoint your agent can call from outside the editor, running Epic's tools in-process instead of over MCP, with the safety rails unattended work needs. Free and open source; join us on [Discord](https://discord.gg/fchq).
 
 It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Python, so it works from any language. A stdlib-only Python client is included.
 
-## Why use the bridge
+## What you get that MCP or Python alone don't
 
-- **Fast by default.** Commands run as embedded Python on the editor thread. Epic's creator toolsets are called in-process through the Toolset Registry, and the official UEFN MCP server is only the last resort, so the common path skips MCP's HTTP and discovery overhead and the editor hangs Epic lists as a known MCP issue.
-- **Safe for unattended automation.** One editor command runs at a time. A call that may have started and then timed out or disconnected is reported as `outcome_unknown`, and the bridge never replays it on another route. Check the editor's state before you retry a change yourself, so you do not duplicate a device, entity, file write or session. Add `"if_busy": "reject"` to fail fast instead of queueing.
-- **Tells you what the editor is doing.** `status` and `GET /` answer instantly with the running command, the queue and the time since the editor last ticked, so a slow build looks different from a modal dialog or a hung editor.
-- **Realistic deadlines.** Session start, push and Verse build get up to 10 minutes by default instead of timing out while they still work; any request can set its own `timeout_s`.
-- **Honest results.** Python that raises fails the command with its traceback and output; deletes report what they could not delete; rotations follow the documented `[pitch, yaw, roll]`.
-- **Covers what `unreal.*` cannot.** Friendly names for all 42 UEFN-specific tools (Verse files and builds, play sessions, Creative devices, Scene Graph entities) plus generic access to every approved creator toolset.
+- **Both halves, one endpoint.** The full UEFN Python API plus Epic's Verse, session, device and Scene Graph tools, with friendly names for all 42 UEFN-specific tools and generic access to every approved creator toolset.
+- **Faster calls.** Commands run as embedded Python on the editor thread and Epic's tools run in-process through the Toolset Registry, skipping MCP's HTTP and discovery overhead. MCP is only the last resort.
+- **No silent duplicates.** One editor command runs at a time, and a call that timed out after it may have started is reported as `outcome_unknown` and never replayed on another route, so you check the editor before retrying instead of stacking a second device, entity or session.
+- **Knows when the editor is stuck.** `status` answers instantly, even mid-build, with the running command, the queue and the time since the editor last ticked, so a modal dialog or a hang looks different from a slow build. Add `"if_busy": "reject"` to fail fast instead of queueing.
+- **Deadlines that fit UEFN.** Session start, push and Verse build get up to 10 minutes by default, so long operations stop reporting false timeouts.
+- **Results instead of log-diving.** Every call returns its result to the caller and names the route that handled it; Python that raises fails with its traceback and output; deletes list what they could not delete.
+- **Keeps running in the background.** At start the bridge switches off UEFN's "Use Less CPU when in Background" throttle where the editor allows it (`fix_throttle` switches it off again), so automation does not stall when the editor is not focused.
+- **Undoable edits.** Direct actor edits run inside editor transactions, and `batch.exec` turns many edits into one undo step.
 - **Stays current.** The bridge checks for a newer release at startup, and `bridge.update` installs it after verifying every file, keeping a backup. Automatic installs are opt-in.
-- **Local only.** Loopback addresses only, cross-origin web pages are rejected, MCP is restricted to loopback, and nothing drives the desktop or UI.
+- **Any language, local only.** Plain HTTP + JSON with a stdlib Python client; loopback only, with cross-origin web pages rejected.
 
 ## What you can automate
 
