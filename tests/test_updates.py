@@ -185,7 +185,7 @@ class ApplyUpdateTests(unittest.TestCase):
                 updates.apply_update(str(self.dir), "0.5.0", FakeRepository("0.6.0", self.NEW))
         finally:
             updates._INSTALL_LOCK.release()
-        self.assertIn("another bridge update", str(caught.exception))
+        self.assertIn("another bridge update or a reload", str(caught.exception))
         self.assertEqual(self.read("server.py"), self.OLD["server.py"])
         self.assertFalse((self.dir / updates.BACKUP_DIR_NAME).exists())
 
@@ -355,6 +355,30 @@ class ServerIntegrationTests(unittest.TestCase):
         scheduled = self.ticks()
         self.assertEqual(len(scheduled), 1)
         server._request_serial_lock.release()
+
+    def test_a_reload_that_meets_an_install_waits_for_a_later_tick(self):
+        stopped = []
+        with mock.patch.object(server, "stop", side_effect=lambda: stopped.append(True)):
+            self.assertTrue(server._request_serial_lock.acquire(blocking=False))
+            with updates._INSTALL_LOCK:
+                server._reload_from_disk(release_turn=True)
+            self.assertEqual(stopped, [], "the server was not stopped mid-install")
+            self.assertTrue(server._reload_requested, "the reload is asked for again")
+            self.assertTrue(server._request_serial_lock.acquire(blocking=False), "the turn was handed back")
+            server._request_serial_lock.release()
+
+    def test_a_reload_holds_the_install_lock_while_it_reads_the_files(self):
+        held = []
+
+        def read_attempt(*_args, **_kwargs):
+            held.append(updates.install_in_progress())
+            raise OSError("stop here")
+
+        with mock.patch.object(server, "stop"), mock.patch.dict(sys.modules), \
+                mock.patch("builtins.open", side_effect=read_attempt), self.assertRaises(OSError):
+            server._reload_from_disk()
+        self.assertEqual(held, [True])
+        self.assertFalse(updates.install_in_progress(), "released afterwards")
 
     def test_update_without_reload_leaves_the_bridge_running(self):
         outcome = dict(self.OUTCOME)

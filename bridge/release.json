@@ -4,10 +4,10 @@
     "client.py": "bd68e848091a1516dd3f4da5bf1a9bf9735b240a90074c6fcbcd4f27a8d62970",
     "mcp_client.py": "32bc109afe99ab48b961c049de2fe1cb45c8ad90b01af2514f5f3bb6f156922f",
     "routes.py": "e59946a44b8f4126734ffa29213e3193e5b6a3c83c1a4cacffc9975bdcff155b",
-    "server.py": "91dab1051e3d8960b574f001ff7bf540dc7703eff9aa814110cdc555731f42e7",
+    "server.py": "a3fa99cc013e4753c3220dc72da641d25304abf8e54d5ba30846aa5090f0458f",
     "startup.py": "00a5fdcde7de6f84a97712c012b101a33c95303e39f5b052ce4ecac3fc900cb6",
     "uefn_tool_policy.py": "46db42bfee12370f027d666a587e1cef0699063c104b43dec272a685f236a4c6",
-    "updates.py": "d66d2b2697df1ea732178ded2d616b9b2020579d540c7dfe3919c6db3a7c325c"
+    "updates.py": "c14563f62b4114b9b00b38711da7a956f8f284ec54b4e288d6681c85c5e880f6"
   },
   "version": "0.5.0"
 }

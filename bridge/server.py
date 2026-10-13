@@ -909,19 +909,31 @@ def _reload_from_disk(release_turn: bool = False) -> None:
     start before the reload. It is released once the server has stopped, so
     any request still waiting for it is answered as "stopping".
     """
+    global _reload_requested
     script_path = _SCRIPT_PATH
-    try:
-        stop()
-    finally:
+    # Hold the shared install lock from stop to restart, so no install swaps files
+    # while they are read. This runs on the editor thread and must not block: if
+    # an install holds the lock, ask again and let a later tick retry.
+    if not updates._INSTALL_LOCK.acquire(blocking=False):
         if release_turn:
             _request_serial_lock.release()
-    _log("Reloading from disk...")
-    for name in _SIBLING_MODULES:
-        sys.modules.pop(name, None)
-        sys.modules.pop(f"bridge.{name}", None)
-    with open(script_path, "r", encoding="utf-8") as f:
-        code = f.read()
-    exec(code, {"__file__": script_path, "__name__": "__reloaded__", "__builtins__": __builtins__})
+        _reload_requested = True
+        return
+    try:
+        try:
+            stop()
+        finally:
+            if release_turn:
+                _request_serial_lock.release()
+        _log("Reloading from disk...")
+        for name in _SIBLING_MODULES:
+            sys.modules.pop(name, None)
+            sys.modules.pop(f"bridge.{name}", None)
+        with open(script_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        exec(code, {"__file__": script_path, "__name__": "__reloaded__", "__builtins__": __builtins__})
+    finally:
+        updates._INSTALL_LOCK.release()
 
 
 @command("reload")

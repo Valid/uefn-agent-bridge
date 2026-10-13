@@ -168,7 +168,7 @@ def apply_update(
     if checkout:
         raise UpdateError(f"this bridge runs from the git checkout {checkout}; update it with git pull")
     if not _INSTALL_LOCK.acquire(blocking=False):
-        raise UpdateError("another bridge update is being installed; check status when it finishes")
+        raise UpdateError("another bridge update or a reload is in progress; try again when it finishes")
     try:
         return _install(bridge_dir, current_version, fetch, allow_downgrade)
     finally:
