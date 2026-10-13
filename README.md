@@ -9,7 +9,7 @@ It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Pyt
 ## Why use the bridge
 
 - **Fast by default.** Commands run as embedded Python on the editor thread. Epic's creator toolsets are called in-process through the Toolset Registry, and the official UEFN MCP server is only the last resort, so the common path skips MCP's HTTP and discovery overhead and the editor hangs Epic lists as a known MCP issue.
-- **Safe for unattended automation.** One editor command runs at a time. A call that may have started and then timed out or disconnected is reported as `outcome_unknown` and never replayed, so a retry cannot duplicate a device, entity, file write or session. Add `"if_busy": "reject"` to fail fast instead of queueing.
+- **Safe for unattended automation.** One editor command runs at a time. A call that may have started and then timed out or disconnected is reported as `outcome_unknown`, and the bridge never replays it on another route. Check the editor's state before you retry a change yourself, so you do not duplicate a device, entity, file write or session. Add `"if_busy": "reject"` to fail fast instead of queueing.
 - **Tells you what the editor is doing.** `status` and `GET /` answer instantly with the running command, the queue and the time since the editor last ticked, so a slow build looks different from a modal dialog or a hung editor.
 - **Realistic deadlines.** Session start, push and Verse build get up to 10 minutes by default instead of timing out while they still work; any request can set its own `timeout_s`.
 - **Honest results.** Python that raises fails the command with its traceback and output; deletes report what they could not delete; rotations follow the documented `[pitch, yaw, roll]`.
