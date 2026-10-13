@@ -1,2 +1,2 @@
-# UEFN Python Bridge
-# https://github.com/Valid/uefn-python-bridge
+# UEFN Agent Bridge
+# https://github.com/Valid/uefn-agent-bridge

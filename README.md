@@ -1,8 +1,10 @@
-# UEFN Python Bridge: control Unreal Editor for Fortnite from AI agents, scripts and CI
+# UEFN Agent Bridge: control Unreal Editor for Fortnite from AI agents, scripts and CI
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
-**Give your AI agent all of UEFN, not half of it.** Epic's MCP is slow, reaches only the Fortnite tools Epic exposes, and by Epic's own notes can stall the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) puts both behind one fast local endpoint your agent can call from outside the editor, running Epic's tools in-process instead of over MCP, with the safety rails unattended work needs. Free and open source; join us on [Discord](https://discord.gg/fchq).
+*Formerly `uefn-python-bridge`; old links and clones redirect here.*
+
+**Give your AI agent all of UEFN, not half of it.** Epic's MCP is slow, reaches only the Fortnite tools Epic exposes, and by Epic's own notes can stall the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Agent Bridge](https://github.com/Valid/uefn-agent-bridge) puts both behind one fast local endpoint your agent can call from outside the editor, running Epic's tools in-process instead of over MCP, with the safety rails unattended work needs. Free and open source; join us on [Discord](https://discord.gg/fchq).
 
 It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Python, so it works from any language. A stdlib-only Python client is included.
 
@@ -37,7 +39,7 @@ It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Pyt
 
 Paste this into an AI coding agent:
 
-> Clone https://github.com/Valid/uefn-python-bridge and help me set it up with my UEFN project.
+> Clone https://github.com/Valid/uefn-agent-bridge and help me set it up with my UEFN project.
 
 The included [`RULES.md`](RULES.md) explains the routing contract and working UEFN Python patterns.
 
@@ -79,7 +81,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.5.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.5.1 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 92 commands registered
 ```
 
@@ -401,7 +403,7 @@ Plain property access works for numbers, object references, and reference arrays
 A few seconds after it starts, the bridge reads the published `bridge/release.json` from this repository's `main` branch. If that version is newer, the Output Log says so once, and `status` and `GET /` carry the result:
 
 ```json
-"update": {"current": "0.5.0", "latest": "0.5.1", "available": true, "checked_at": "2026-10-13T04:00:00Z", "error": null, "install": "copy"}
+"update": {"current": "0.5.1", "latest": "0.5.2", "available": true, "checked_at": "2026-10-13T04:00:00Z", "error": null, "install": "copy"}
 ```
 
 - **Install it:** send `{"command": "bridge.update"}`. The bridge downloads every file the manifest lists, checks each file's SHA-256 against it, and changes nothing unless all of them match. Each install copies the files it replaces to its own `bridge/.bridge-backup/<installed version>-<UTC time>/` folder, swaps the new ones in (rolling back if a swap fails), and reloads itself once no command is running or waiting on a native tool. Pass `"reload": false` to reload later; a later `bridge.update` or `reload` picks up the installed files. It never installs an older version unless you pass `"allow_downgrade": true`.
@@ -480,7 +482,7 @@ When Epic changes its creator toolsets, review the official exposed schemas befo
 
 ## Support
 
-- [GitHub Issues](https://github.com/Valid/uefn-python-bridge/issues)
+- [GitHub Issues](https://github.com/Valid/uefn-agent-bridge/issues)
 - [Discord](https://discord.gg/fchq)
 
 ## License

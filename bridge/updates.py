@@ -23,7 +23,7 @@ import time
 import urllib.request
 from typing import Callable, Dict, List, Optional
 
-REPOSITORY = "Valid/uefn-python-bridge"
+REPOSITORY = "Valid/uefn-agent-bridge"
 BRANCH = "main"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPOSITORY}/{BRANCH}/bridge/"
 MANIFEST_NAME = "release.json"
@@ -66,7 +66,7 @@ def content_digest(data: bytes) -> str:
 
 def fetch_url(url: str, timeout_s: float = FETCH_TIMEOUT_S) -> bytes:
     """Read a URL over HTTPS with the default certificate checks."""
-    request = urllib.request.Request(url, headers={"User-Agent": "uefn-python-bridge-updater"})
+    request = urllib.request.Request(url, headers={"User-Agent": "uefn-agent-bridge-updater"})
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
         data = response.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:

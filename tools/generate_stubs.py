@@ -7,7 +7,7 @@ Output:  <Project>/Saved/unreal.pyi
 Point your IDE (VS Code, Cursor, etc.) at this file for autocomplete:
     "python.analysis.extraPaths": ["path/to/Saved"]
 
-Docs: https://github.com/Valid/uefn-python-bridge
+Docs: https://github.com/Valid/uefn-agent-bridge
 """
 
 import os

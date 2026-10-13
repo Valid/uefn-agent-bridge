@@ -1,13 +1,13 @@
 {
   "files": {
-    "__init__.py": "3a38bd2ea647eaf04ae175534e1ba9290d8804cb897ca02d62486598aef4ab0d",
-    "client.py": "bd68e848091a1516dd3f4da5bf1a9bf9735b240a90074c6fcbcd4f27a8d62970",
-    "mcp_client.py": "32bc109afe99ab48b961c049de2fe1cb45c8ad90b01af2514f5f3bb6f156922f",
+    "__init__.py": "def76a4cd303fc622be6c60ce9816622f5ad81e0a7fcd45b4a85e1177b8b9d51",
+    "client.py": "4ff1b5e68c1ef901066fe3c76c7dc49872e231f8d7ae9aaac1e8a555c1a02ac6",
+    "mcp_client.py": "af9c8601114fe0aff5c2b63c9a66f710ffc217a1bfc7372d27a0ed045bc2851a",
     "routes.py": "e59946a44b8f4126734ffa29213e3193e5b6a3c83c1a4cacffc9975bdcff155b",
-    "server.py": "9468b4707bec8ddfd37f1d91edba90979549cca1fe9565a7b6b6cce58b1054d3",
-    "startup.py": "00a5fdcde7de6f84a97712c012b101a33c95303e39f5b052ce4ecac3fc900cb6",
+    "server.py": "e9af62e683f1dfbaf2ef40bbeea47cd4c02cbe6012351fb14972b725d01eea99",
+    "startup.py": "6702c38060cbadfb146956a1b4eca181fdf66a6199e5d13b2616eacc4dbdf713",
     "uefn_tool_policy.py": "46db42bfee12370f027d666a587e1cef0699063c104b43dec272a685f236a4c6",
-    "updates.py": "c14563f62b4114b9b00b38711da7a956f8f284ec54b4e288d6681c85c5e880f6"
+    "updates.py": "52a0e81e7b8f2ea32ea294009287c50b2e3112c399b732fb43adc984e6ee252d"
   },
-  "version": "0.5.0"
+  "version": "0.5.1"
 }

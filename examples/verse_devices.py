@@ -1,4 +1,4 @@
-"""Example: Inspecting placed Verse devices via the UEFN Python Bridge.
+"""Example: Inspecting placed Verse devices via the UEFN Agent Bridge.
 
 Run from your local machine (outside UEFN) with the bridge server running.
 

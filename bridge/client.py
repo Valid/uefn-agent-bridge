@@ -1,4 +1,4 @@
-"""Lightweight Python client for the UEFN Python Bridge.
+"""Lightweight Python client for the UEFN Agent Bridge.
 
 This runs *outside* the editor (your local machine, CI, AI agent, etc.)
 and sends commands to the bridge server running inside UEFN.
@@ -12,7 +12,7 @@ Usage:
     print(ue.exec("result = 2 + 2"))     # run arbitrary python
     print(ue.run("actors.spawn", asset_path="/Engine/BasicShapes/Cube", location=[100, 0, 50]))
 
-Docs: https://github.com/Valid/uefn-python-bridge
+Docs: https://github.com/Valid/uefn-agent-bridge
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class UEFNBridge:
-    """Send commands to the UEFN Python Bridge HTTP server."""
+    """Send commands to the UEFN Agent Bridge HTTP server."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9210, timeout: float = 30.0):
         self.base_url = f"http://{host}:{port}"
