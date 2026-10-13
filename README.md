@@ -76,7 +76,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.3.1 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.4.0 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 90 commands registered
 ```
 
@@ -125,6 +125,24 @@ The complete response envelope includes the route that actually handled the requ
 
 An MCP fallback also includes `fallback_reason`. Failures whose side effect cannot be determined include `outcome_unknown`.
 
+### Busy, Stalled, and Deadlines
+
+The bridge serves one editor command at a time; other requests wait their turn. `status` and `GET /` never wait, and both report what the bridge is doing:
+
+```json
+"activity": {
+  "editor_command": {"command": "verse.build", "state": "waiting_on_tool", "seconds": 41.2},
+  "dispatch_turn": {"command": "verse.build", "seconds": 41.3},
+  "waiting": 1,
+  "editor_tick_age_s": 0.03
+}
+```
+
+- `editor_command` is the command running on the editor thread (`state` is `running`, or `waiting_on_tool` while a native tool works), and `dispatch_turn` is the request being served. `waiting` counts the requests queued behind it.
+- `editor_tick_age_s` is the time since the editor last ran the bridge's tick. It grows while the editor's game thread is blocked. A large value with `editor_command` set means a bridge command is slow; with `editor_command` empty, something outside the bridge holds the editor, such as a modal dialog.
+- Add `"if_busy": "reject"` to a request to fail fast instead of queueing. A busy bridge answers HTTP 409 with `busy` (the same `activity` object) and starts nothing. The Python client raises `BridgeBusy`.
+- Without `timeout_s`, a request's deadline is 30 seconds, except for tools that routinely take longer: `session.start`, `session.push_changes` and `verse.build` get 600 seconds, `session.stop` and `session.start_game` 180, and `session.stop_game` 120. The same applies to `toolsets.call` and `mcp.call` naming those tools. The Python client waits at least as long.
+
 ### Python Client
 
 ```python
@@ -153,7 +171,7 @@ status = ue.call_tool(
 mcp_status = ue.run("mcp.status", timeout_s=120)
 ```
 
-`UEFNBridge.run()` returns only the result. Use `UEFNBridge.request()` when you need the complete envelope, or inspect `ue.last_response` and `ue.last_route` after a call. `UEFNBridge.planned_route(command)` explains the initial route without contacting UEFN.
+`UEFNBridge.run()` returns only the result. Use `UEFNBridge.request()` when you need the complete envelope, or inspect `ue.last_response` and `ue.last_route` after a call. `UEFNBridge.planned_route(command)` explains the initial route without contacting UEFN. A failed command raises `BridgeError`; its `envelope` holds the complete failure response (for example an `exec` traceback with `stdout`). Pass `if_busy="reject"` to `run()` or `request()` to get `BridgeBusy` instead of waiting behind another command.
 
 ### curl
 
@@ -237,8 +255,8 @@ These direct `verse.*` commands inspect placed generated device objects. They ar
 | `viewport.camera` | Read viewport location and rotation |
 | `viewport.set_camera` | Move the viewport camera |
 | `materials.create_instance` | Create a material instance with parameters |
-| `status` | Return version, routing configuration, and commands |
-| `exec` | Run embedded Python and return the variable named `result` |
+| `status` | Return version, routing configuration, commands, and current activity |
+| `exec` | Run embedded Python and return the variable named `result`. If the code raises, the command fails (`ok: false`) and still returns `result`, `stdout`, `stderr` and `traceback`; changes made before the exception stay |
 | `batch.exec` | Run direct Python commands in one undo transaction and main-thread tick |
 | `undo`, `redo` | Use the editor transaction history |
 | `log`, `history` | Inspect bridge diagnostics |
@@ -395,7 +413,7 @@ RULES.md               LLM context and operating rules
 
 - UEFN is not standard Unreal Engine. Many standard UE5 Python APIs are stripped or changed. See [`RULES.md`](RULES.md) for tested patterns.
 - Epic documents editor hitching or hanging during MCP calls. Prefer direct Python and the in-process registry.
-- Any request can include a top-level `timeout_s` up to 600 seconds. A timeout after dispatch is not proof that the operation failed.
+- Any request can include a top-level `timeout_s` up to 600 seconds; without one, slow session and build tools get longer defaults (Busy, Stalled, and Deadlines above). A timeout after dispatch is not proof that the operation failed.
 - If background throttling returns, run `fix_throttle` or focus UEFN.
 - Start manually with `bridge/server.py`, or copy `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside the `bridge/` package for project auto-start.
 - Use `reload` after changing only `bridge/server.py`. Restart UEFN after changing sibling modules such as `routes.py`, `uefn_tool_policy.py`, or `mcp_client.py`; simply re-running `server.py` does not evict those modules from Python's import cache.

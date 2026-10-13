@@ -158,6 +158,34 @@ READ_ONLY_TOOL_ROUTES = frozenset({
 })
 
 
+# Native tools that routinely run longer than the bridge's 30 s default
+# deadline. The bridge applies these when a request sets no ``timeout_s``, and
+# the bundled client waits at least as long. Starting a session cooks and
+# uploads content; building and pushing compile Verse.
+SLOW_TOOL_DEADLINES_S: Dict[ToolRoute, float] = {
+    (_SESSION_TOOLSET, "StartSession"): 600.0,
+    (_SESSION_TOOLSET, "StopSession"): 180.0,
+    (_SESSION_TOOLSET, "StartGame"): 180.0,
+    (_SESSION_TOOLSET, "StopGame"): 120.0,
+    (_SESSION_TOOLSET, "PushChanges"): 600.0,
+    (_VERSE_TOOLSET, "BuildAll"): 600.0,
+}
+
+
+def default_deadline_s(command: str, params: Optional[dict] = None, fallback: float = 30.0) -> float:
+    """Deadline for a request that sets no ``timeout_s``.
+
+    Friendly aliases and ``toolsets.call``/``mcp.call`` naming a slow native
+    tool get that tool's deadline; everything else gets ``fallback``.
+    """
+    route = TOOLSET_ROUTES.get(command)
+    if route is None and command in ("toolsets.call", "mcp.call") and isinstance(params, dict):
+        toolset, tool = params.get("toolset_name"), params.get("tool_name")
+        if isinstance(toolset, str) and isinstance(tool, str):
+            route = (toolset, tool)
+    return SLOW_TOOL_DEADLINES_S.get(route, fallback) if route else fallback
+
+
 def resolve_tool_route(command: str) -> Optional[ToolRoute]:
     """Return the native toolset route for a friendly bridge command."""
     return TOOLSET_ROUTES.get(command)
