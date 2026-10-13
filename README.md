@@ -1,36 +1,39 @@
-# UEFN Hybrid Python Bridge
+# UEFN Python Bridge: control Unreal Editor for Fortnite from AI agents, scripts and CI
 
-A local HTTP bridge for programmatic UEFN editor automation. It keeps the fast embedded-Python path for everything Python can handle, calls Epic's creator-exposed tools through the in-process Toolset Registry when needed, and uses Epic's official UEFN MCP server only as a last-resort transport.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
-All access is through HTTP or embedded Python. The bridge does not use desktop or UI automation.
+**Give your AI agent all of UEFN, not half of it.** Epic's MCP is slow, reaches only the Fortnite tools Epic exposes, and by Epic's own notes can stall the editor; UEFN's Python reaches the whole editor, but only from inside it. [UEFN Python Bridge](https://github.com/Valid/uefn-python-bridge) puts both behind one fast local endpoint your agent can call from outside the editor, running Epic's tools in-process instead of over MCP, with the safety rails unattended work needs. Free and open source; join us on [Discord](https://discord.gg/fchq).
 
-## Routing Strategy
+It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Python, so it works from any language. A stdlib-only Python client is included.
 
-Every request follows a deterministic route:
+## What you get that MCP or Python alone don't
 
-| Priority | Response `route` | Used for |
-|---|---|---|
-| 1 | `python` | Existing bridge commands for actors, assets, levels, materials, viewport control, and placed Verse-device inspection |
-| 2 | `toolset_registry` | Epic creator-exposed toolsets called directly inside UEFN, without MCP transport overhead |
-| 3 | `mcp` | Official loopback UEFN MCP when the requested capability or local registry is unavailable before dispatch |
+- **Both halves, one endpoint.** The full UEFN Python API plus Epic's Verse, session, device and Scene Graph tools, with friendly names for all 42 UEFN-specific tools and generic access to every approved creator toolset.
+- **Faster calls.** Commands run as embedded Python on the editor thread and Epic's tools run in-process through the Toolset Registry, skipping MCP's HTTP and discovery overhead. MCP is only the last resort.
+- **No silent duplicates.** One editor command runs at a time, and a call that timed out after it may have started is reported as `outcome_unknown` and never replayed on another route, so you check the editor before retrying instead of stacking a second device, entity or session.
+- **Knows when the editor is stuck.** `status` answers instantly, even mid-build, with the running command, the queue and the time since the editor last ticked, so a modal dialog or a hang looks different from a slow build. Add `"if_busy": "reject"` to fail fast instead of queueing.
+- **Deadlines that fit UEFN.** Session start, push and Verse build get up to 10 minutes by default, so long operations stop reporting false timeouts.
+- **Results instead of log-diving.** Every call returns its result to the caller and names the route that handled it; Python that raises fails with its traceback and output; deletes list what they could not delete.
+- **Keeps running in the background.** At start the bridge switches off UEFN's "Use Less CPU when in Background" throttle where the editor allows it (`fix_throttle` switches it off again), so automation does not stall when the editor is not focused.
+- **Undoable edits.** Direct actor edits run inside editor transactions, and `batch.exec` turns many edits into one undo step.
+- **Stays current.** The bridge checks for a newer release at startup, and `bridge.update` installs it after verifying every file, keeping a backup. Automatic installs are opt-in.
+- **Any language, local only.** Plain HTTP + JSON with a stdlib Python client; loopback only, with cross-origin web pages rejected.
 
-Named direct commands never detour through MCP. The 42 UEFN-specific friendly aliases and `toolsets.*` commands try the local Toolset Registry first. The `mcp.*` commands explicitly bypass local routing for diagnostics or compatibility testing.
+## What you can automate
 
-Fallback is mutation-safe. Once a Toolset Registry or MCP call may have started, a timeout, disconnect, malformed response, or unknown result is returned with `"outcome_unknown": true` and is not replayed through another route. This prevents duplicate entities, devices, file writes, sessions, or event bindings.
+| Task | Commands |
+|---|---|
+| Spawn, move, duplicate, delete and inspect actors | `actors.spawn`, `actors.transform`, `actors.duplicate`, `actors.delete`, `actors.list`, `actors.properties` |
+| Find, import, rename and save assets | `assets.search`, `assets.import_task`, `assets.rename`, `assets.save` |
+| Place Creative devices and wire events | `devices.place`, `devices.set_property`, `devices.add_event_binding` |
+| Edit Verse device `@editable` properties on placed devices | `verse.find_device`, `verse.get_properties`, `verse.set_property` |
+| Read, write, search and build Verse | `verse.read_file`, `verse.write_file`, `verse.grep`, `verse.build` |
+| Launch a play session, start a match, push changes | `session.start`, `session.start_game`, `session.push_changes`, `session.status` |
+| Scene Graph entities and components | `entities.create`, `entities.add_component`, `entities.set_component_property` |
+| Material instances, viewport camera, level save | `materials.create_instance`, `viewport.set_camera`, `level.save` |
+| Anything else in the editor | `exec` (run Python), `batch.exec` (several commands in one undo step), `toolsets.call` |
 
-## Why Hybrid
-
-UEFN's Python API is fast and broad for normal editor automation, but some Fortnite-specific operations are not available through `unreal.*`. Epic's creator toolsets add Verse-file, play-session, device, and Scene Graph entity capabilities. Calling those toolsets through the in-process registry avoids the fixed HTTP and discovery cost of MCP whenever possible.
-
-Epic currently lists editor slowdowns and hangs during MCP calls as a known issue. Keeping MCP as the final route makes the common path responsive while retaining the capabilities that only Epic's toolsets expose.
-
-Official references:
-
-- [Unreal MCP is now available in UEFN](https://www.fortnite.com/news/unreal-mcp-is-now-available-in-uefn)
-- [UEFN MCP setup and known issues](https://dev.epicgames.com/documentation/fortnite/uefn-mcp)
-- [Unreal MCP architecture](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor)
-
-## Fastest Setup
+## Quick Start
 
 Paste this into an AI coding agent:
 
@@ -77,12 +80,38 @@ The Output Log should include:
 
 ```text
 [Bridge 12:34:56] Bridge v0.5.0 listening on http://127.0.0.1:9210
-[Bridge 12:34:56] 90 commands registered
+[Bridge 12:34:56] 92 commands registered
 ```
 
 The bridge checks ports 9210 through 9220 and uses the first available port.
 If it selects a port other than 9210, pass the logged port to
 `UEFNBridge(port=...)` or use that port in raw HTTP requests.
+
+## How Routing Works: Python First, Toolsets Next, MCP Last
+
+Every request follows a deterministic route:
+
+| Priority | Response `route` | Used for |
+|---|---|---|
+| 1 | `python` | Existing bridge commands for actors, assets, levels, materials, viewport control, and placed Verse-device inspection |
+| 2 | `toolset_registry` | Epic creator-exposed toolsets called directly inside UEFN, without MCP transport overhead |
+| 3 | `mcp` | Official loopback UEFN MCP when the requested capability or local registry is unavailable before dispatch |
+
+Named direct commands never detour through MCP. The 42 UEFN-specific friendly aliases and `toolsets.*` commands try the local Toolset Registry first. The `mcp.*` commands explicitly bypass local routing for diagnostics or compatibility testing.
+
+Fallback is mutation-safe. Once a Toolset Registry or MCP call may have started, a timeout, disconnect, malformed response, or unknown result is returned with `"outcome_unknown": true` and is not replayed through another route. This prevents duplicate entities, devices, file writes, sessions, or event bindings.
+
+### Why hybrid
+
+UEFN's Python API is fast and broad for normal editor automation, but some Fortnite-specific operations are not available through `unreal.*`. Epic's creator toolsets add Verse-file, play-session, device, and Scene Graph entity capabilities. Calling those toolsets through the in-process registry avoids the fixed HTTP and discovery cost of MCP whenever possible.
+
+Epic currently lists editor slowdowns and hangs during MCP calls as a known issue. Keeping MCP as the final route makes the common path responsive while retaining the capabilities that only Epic's toolsets expose.
+
+Official references:
+
+- [Unreal MCP is now available in UEFN](https://www.fortnite.com/news/unreal-mcp-is-now-available-in-uefn)
+- [UEFN MCP setup and known issues](https://dev.epicgames.com/documentation/fortnite/uefn-mcp)
+- [Unreal MCP architecture](https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor)
 
 ## Sending Commands
 

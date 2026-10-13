@@ -47,19 +47,6 @@ if not _SCRIPT_PATH:
         if fi.filename and "server.py" in fi.filename and os.path.isfile(fi.filename):
             _SCRIPT_PATH = os.path.abspath(fi.filename)
             break
-    if not _SCRIPT_PATH:
-        for candidate in [
-            os.path.join(
-                os.path.expanduser("~"),
-                ".uefn-copilot",
-                "uefn-python-bridge",
-                "bridge",
-                "server.py",
-            ),
-        ]:
-            if os.path.isfile(candidate):
-                _SCRIPT_PATH = candidate
-                break
 if _SCRIPT_PATH:
     _BRIDGE_DIR = os.path.dirname(_SCRIPT_PATH)
     if _BRIDGE_DIR not in sys.path:
