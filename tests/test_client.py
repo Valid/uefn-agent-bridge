@@ -133,6 +133,20 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(caught.exception.outcome_unknown)
         self.assertEqual(caught.exception.route, "toolset_registry")
 
+    def test_allow_save_all_is_sent_only_when_set(self):
+        bridge = FakeBridge({"ok": True, "route": "python", "result": {}})
+
+        bridge.call_tool(
+            "editor_toolset.toolsets.asset.AssetTools",
+            "save_assets",
+            {"asset_paths": []},
+            allow_save_all=True,
+        )
+        self.assertTrue(bridge.sent_payload["params"]["allow_save_all"])
+
+        bridge.mcp_call("Example.Tools", "Read", {})
+        self.assertNotIn("allow_save_all", bridge.sent_payload["params"])
+
     def test_call_tool_uses_hybrid_command(self):
         bridge = FakeBridge({"ok": True, "route": "python", "result": {}})
 

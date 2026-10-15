@@ -79,9 +79,14 @@ _VERSE_TOOLSET = "ValkyrieToolset.VerseToolset"
 _SESSION_TOOLSET = "ValkyrieToolset.SessionToolset"
 _DEVICE_TOOLSET = "ValkyrieToolset.DeviceToolset"
 _ENTITY_TOOLSET = "ValkyrieToolset.EntityToolset"
+_UMG_TOOLSET = "UMGToolSet.UMGToolSet"
+_VERSE_FIELDS_TOOLSET = "VerseFieldsToolset.VerseFieldsToolset"
+_MVVM_TOOLSET = "MVVMToolset.MVVMToolset"
 
 
-# Friendly bridge aliases for the 42 UEFN-specific tools shipped in v42. The
+# Friendly bridge aliases for the 42 UEFN-specific tools shipped in v42, plus
+# the widget tools a UMG screen needs (widget tree, Verse fields and view
+# bindings; see "Widget Blueprints and Verse UI" in RULES.md). The other
 # generic toolsets remain available through toolsets.call without inflating the
 # command list or forcing schema discovery into every agent context.
 TOOLSET_ROUTES: Dict[str, ToolRoute] = {
@@ -131,6 +136,38 @@ TOOLSET_ROUTES: Dict[str, ToolRoute] = {
     "entities.delete": (_ENTITY_TOOLSET, "DeleteEntity"),
     "entities.create": (_ENTITY_TOOLSET, "CreateEntity"),
     "entities.add_component": (_ENTITY_TOOLSET, "AddComponent"),
+
+    "widgets.list_blueprints": (_UMG_TOOLSET, "ListWidgetBlueprints"),
+    "widgets.list_classes": (_UMG_TOOLSET, "ListWidgetClasses"),
+    "widgets.class_info": (_UMG_TOOLSET, "GetWidgetClassInfo"),
+    "widgets.describe": (_UMG_TOOLSET, "GetWidgetDescription"),
+    "widgets.tree": (_UMG_TOOLSET, "GetWidgets"),
+    "widgets.named_slots": (_UMG_TOOLSET, "GetNamedSlots"),
+    "widgets.create_blueprint": (_UMG_TOOLSET, "CreateWidgetBlueprint"),
+    "widgets.compile": (_UMG_TOOLSET, "CompileWidgetBlueprint"),
+    "widgets.add": (_UMG_TOOLSET, "AddWidget"),
+    "widgets.remove": (_UMG_TOOLSET, "RemoveWidget"),
+    "widgets.rename": (_UMG_TOOLSET, "RenameWidget"),
+    "widgets.move": (_UMG_TOOLSET, "MoveWidget"),
+    "widgets.wrap": (_UMG_TOOLSET, "WrapWidgets"),
+    "widgets.replace_with_template": (_UMG_TOOLSET, "ReplaceWidgetWithTemplate"),
+    "widgets.set_named_slot_content": (_UMG_TOOLSET, "SetNamedSlotContent"),
+
+    "widgets.verse_field_types": (_VERSE_FIELDS_TOOLSET, "GetSupportedVerseFieldTypes"),
+    "widgets.verse_fields": (_VERSE_FIELDS_TOOLSET, "ListVerseFields"),
+    "widgets.add_verse_field": (_VERSE_FIELDS_TOOLSET, "AddVerseField"),
+    "widgets.duplicate_verse_field": (_VERSE_FIELDS_TOOLSET, "DuplicateVerseField"),
+    "widgets.edit_verse_field": (_VERSE_FIELDS_TOOLSET, "EditVerseField"),
+    "widgets.remove_verse_field": (_VERSE_FIELDS_TOOLSET, "RemoveVerseField"),
+    "widgets.bind_verse_field": (_VERSE_FIELDS_TOOLSET, "BindWidgetPropertyToVerseField"),
+
+    "widgets.view_bindings": (_MVVM_TOOLSET, "ListWidgetViewBindings"),
+    "widgets.view_events": (_MVVM_TOOLSET, "ListWidgetViewEvents"),
+    "widgets.bindable_properties": (_MVVM_TOOLSET, "ListBindableWidgetProperties"),
+    "widgets.conversion_functions": (_MVVM_TOOLSET, "ListConversionFunctions"),
+    "widgets.create_view_binding": (_MVVM_TOOLSET, "CreateViewBinding"),
+    "widgets.create_view_event_binding": (_MVVM_TOOLSET, "CreateViewEventBinding"),
+    "widgets.remove_view_binding": (_MVVM_TOOLSET, "RemoveWidgetViewBinding"),
 }
 
 
@@ -157,6 +194,18 @@ READ_ONLY_TOOL_ROUTES = frozenset({
     "entities.get_components",
     "entities.get_component_property",
     "entities.find",
+    "widgets.list_blueprints",
+    "widgets.list_classes",
+    "widgets.class_info",
+    "widgets.describe",
+    "widgets.tree",
+    "widgets.named_slots",
+    "widgets.verse_field_types",
+    "widgets.verse_fields",
+    "widgets.view_bindings",
+    "widgets.view_events",
+    "widgets.bindable_properties",
+    "widgets.conversion_functions",
 })
 
 
@@ -171,6 +220,7 @@ SLOW_TOOL_DEADLINES_S: Dict[ToolRoute, float] = {
     (_SESSION_TOOLSET, "StopGame"): 120.0,
     (_SESSION_TOOLSET, "PushChanges"): 600.0,
     (_VERSE_TOOLSET, "BuildAll"): 600.0,
+    (_UMG_TOOLSET, "CompileWidgetBlueprint"): 120.0,
 }
 
 

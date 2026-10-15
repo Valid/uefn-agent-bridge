@@ -10,7 +10,7 @@ It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Pyt
 
 ## What you get that MCP or Python alone don't
 
-- **Both halves, one endpoint.** The full UEFN Python API plus Epic's Verse, session, device and Scene Graph tools, with friendly names for all 42 UEFN-specific tools and generic access to every approved creator toolset.
+- **Both halves, one endpoint.** The full UEFN Python API plus Epic's Verse, session, device and Scene Graph tools, with friendly names for all 42 UEFN-specific tools plus the widget tools a UMG screen needs, and generic access to every approved creator toolset.
 - **Faster calls.** Commands run as embedded Python on the editor thread and Epic's tools run in-process through the Toolset Registry, skipping MCP's HTTP and discovery overhead. MCP is only the last resort.
 - **No silent duplicates.** One editor command runs at a time, and a call that timed out after it may have started is reported as `outcome_unknown` and never replayed on another route, so you check the editor before retrying instead of stacking a second device, entity or session.
 - **Knows when the editor is stuck.** `status` answers instantly, even mid-build, with the running command, the queue and the time since the editor last ticked, so a modal dialog or a hang looks different from a slow build. Add `"if_busy": "reject"` to fail fast instead of queueing.
@@ -81,7 +81,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.5.1 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.6.0 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 92 commands registered
 ```
 
@@ -99,7 +99,7 @@ Every request follows a deterministic route:
 | 2 | `toolset_registry` | Epic creator-exposed toolsets called directly inside UEFN, without MCP transport overhead |
 | 3 | `mcp` | Official loopback UEFN MCP when the requested capability or local registry is unavailable before dispatch |
 
-Named direct commands never detour through MCP. The 42 UEFN-specific friendly aliases and `toolsets.*` commands try the local Toolset Registry first. The `mcp.*` commands explicitly bypass local routing for diagnostics or compatibility testing.
+Named direct commands never detour through MCP. The 71 friendly aliases and `toolsets.*` commands try the local Toolset Registry first. The `mcp.*` commands explicitly bypass local routing for diagnostics or compatibility testing.
 
 Fallback is mutation-safe. Once a Toolset Registry or MCP call may have started, a timeout, disconnect, malformed response, or unknown result is returned with `"outcome_unknown": true` and is not replayed through another route. This prevents duplicate entities, devices, file writes, sessions, or event bindings.
 
@@ -301,7 +301,7 @@ These direct `verse.*` commands inspect placed generated device objects. They ar
 
 ## UEFN-Specific Friendly Aliases
 
-Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable bridge command names. Pass the official tool arguments directly as `params`.
+Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable bridge command names. Version 0.6.0 adds 29 `widgets.*` aliases for Widget Blueprints, their Verse fields and view bindings (see "Widget Blueprints and Verse UI" in [`RULES.md`](RULES.md), including a 42.40 bug where a blueprint made by `widgets.create_blueprint` never reflects its Verse fields). Pass the official tool arguments directly as `params`.
 
 | Domain | Friendly aliases |
 |---|---|
@@ -310,12 +310,15 @@ Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable br
 | Play session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log` |
 | Creative devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding` |
 | Scene Graph entities | `entities.set_transform`, `entities.set_component_property`, `entities.remove_component`, `entities.list_classes`, `entities.list_component_properties`, `entities.list_component_classes`, `entities.get_transform`, `entities.get_components`, `entities.get_component_property`, `entities.find`, `entities.delete`, `entities.create`, `entities.add_component` |
+| Widget Blueprints | `widgets.list_blueprints`, `widgets.list_classes`, `widgets.class_info`, `widgets.describe`, `widgets.tree`, `widgets.named_slots`, `widgets.create_blueprint`, `widgets.compile`, `widgets.add`, `widgets.remove`, `widgets.rename`, `widgets.move`, `widgets.wrap`, `widgets.replace_with_template`, `widgets.set_named_slot_content` |
+| Widget Verse fields | `widgets.verse_field_types`, `widgets.verse_fields`, `widgets.add_verse_field`, `widgets.duplicate_verse_field`, `widgets.edit_verse_field`, `widgets.remove_verse_field`, `widgets.bind_verse_field` |
+| Widget view bindings (MVVM) | `widgets.view_bindings`, `widgets.view_events`, `widgets.bindable_properties`, `widgets.conversion_functions`, `widgets.create_view_binding`, `widgets.create_view_event_binding`, `widgets.remove_view_binding` |
 
 Use `toolsets.describe` before the first unfamiliar call. Epic's JSON schema is the source of truth for parameter names, required fields, object reference shapes, and result values. When a schema requests an Unreal object reference, it commonly uses a JSON object such as `{"refPath":"/Path/To/Object"}`. Do not substitute that shape where a tool expects a plain string.
 
 ## Generic Creator Toolsets
 
-The bridge pins local routing to Epic's creator-exposed UEFN v42 policy: `UEFN-v42-CL-56878558`. The manifest contains exactly 29 toolsets and 384 approved tools. This prevents registered editor-internal toolsets or hidden tools from becoming available through the fast local path.
+The bridge pins local routing to Epic's creator-exposed UEFN 42.40 policy: `UEFN-v42.40-CL-59247843`. The manifest contains exactly 29 toolsets and 386 approved tools. Epic's new `ProgrammaticToolset` (`execute_tool_script`) is left out on purpose; the bridge's own `exec` covers scripting. This prevents registered editor-internal toolsets or hidden tools from becoming available through the fast local path.
 
 | Command | Purpose |
 |---|---|
@@ -366,6 +369,7 @@ The MCP client uses Streamable HTTP, negotiates one session lazily, serializes r
 - MCP discovery is cached for its session. Use `mcp.reset` after restarting Epic's server or changing its tool configuration.
 - MCP requests are serialized, and Toolset Registry dispatch runs on UEFN's main editor thread. Do not issue overlapping session or mutation calls.
 - If a session result reports `StillRunning`, poll `session.status` before issuing another session mutation.
+- `toolsets.call` and `mcp.call` refuse `AssetTools.save_assets` with an empty or missing `asset_paths` list, which would save every unsaved asset in the project. Name the assets you changed, or set `"allow_save_all": true` on purpose.
 
 Epic's UEFN session tools operate Play in Client (PIC) sessions. Do not assume Play in Editor (PIE) behavior or state.
 
@@ -467,6 +471,7 @@ RULES.md               LLM context and operating rules
 - Start manually with `bridge/server.py`, or copy `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside the `bridge/` package for project auto-start.
 - `reload` re-reads `server.py` and its sibling modules (`routes.py`, `uefn_tool_policy.py`, `mcp_client.py`, `updates.py`) from disk, so a changed sibling module no longer needs a UEFN restart.
 - The bridge only connects to loopback MCP endpoints and has no remote-access mode.
+- UEFN 42.40 asks two new questions that block the editor: an "Unreal Editor Security" trust prompt when a project opens, and a toast asking to enable Python Editor Scripting locally. The bridge cannot start until Python is enabled; Epic's MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN` turns it on without the GUI.
 
 ## Contributing
 

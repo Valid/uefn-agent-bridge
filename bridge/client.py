@@ -276,9 +276,15 @@ class UEFNBridge:
         arguments: Optional[dict] = None,
         *,
         allow_mcp_fallback: bool = True,
+        allow_save_all: bool = False,
         timeout_s: float = 120.0,
     ) -> Any:
-        """Use the local Toolset Registry first, then MCP on capability miss."""
+        """Use the local Toolset Registry first, then MCP on capability miss.
+
+        The bridge refuses AssetTools.save_assets with an empty path list
+        (UEFN would save every unsaved asset) unless allow_save_all is set.
+        """
+        extra = {"allow_save_all": True} if allow_save_all else {}
         return self.run(
             "toolsets.call",
             toolset_name=toolset_name,
@@ -286,6 +292,7 @@ class UEFNBridge:
             arguments=arguments or {},
             allow_mcp_fallback=allow_mcp_fallback,
             timeout_s=timeout_s,
+            **extra,
         )
 
     def mcp_call(
@@ -294,16 +301,31 @@ class UEFNBridge:
         tool_name: str,
         arguments: Optional[dict] = None,
         *,
+        allow_save_all: bool = False,
         timeout_s: float = 120.0,
     ) -> Any:
         """Force one call through the official UEFN MCP HTTP server."""
+        extra = {"allow_save_all": True} if allow_save_all else {}
         return self.run(
             "mcp.call",
             toolset_name=toolset_name,
             tool_name=tool_name,
             arguments=arguments or {},
             timeout_s=timeout_s,
+            **extra,
         )
+
+    def inspect_widget(self, blueprint: str, timeout_s: float = 60.0) -> dict:
+        """Read a Widget Blueprint before changing it: tree, Verse fields,
+        view bindings and named slots. ``blueprint`` is its object path,
+        e.g. ``/MyProject/UI/UW_Menu.UW_Menu``."""
+        ref = {"widgetBlueprint": {"refPath": blueprint}}
+        return {
+            "tree": self.run("widgets.tree", timeout_s=timeout_s, **ref),
+            "verse_fields": self.run("widgets.verse_fields", timeout_s=timeout_s, **ref),
+            "view_bindings": self.run("widgets.view_bindings", timeout_s=timeout_s, **ref),
+            "named_slots": self.run("widgets.named_slots", timeout_s=timeout_s, **ref),
+        }
 
     # ── Convenience shortcuts ──────────────────────────────────────────
 

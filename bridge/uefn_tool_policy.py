@@ -3,6 +3,14 @@
 The Toolset Registry contains toolsets that UEFN intentionally does not expose
 to creators. This module is a fail-closed snapshot of the toolsets and tools
 described by the official UEFN MCP server for the recorded UEFN build.
+
+42.40 (CL 59247843) re-pin, from the MCP server's tools/list with Python on:
+VerseFieldsToolset gained GetSupportedVerseFieldTypes; SceneTools gained
+is_actor_hidden, set_actor_hidden, replace_actors_with_asset and
+replace_actors_with_class and lost the three *_level_instance tools. The new
+editor_toolset.toolsets.programmatic.ProgrammaticToolset (execute_tool_script,
+get_execution_environment) is deliberately left out: it runs arbitrary tool
+scripts, which the bridge's own exec command already covers under its rules.
 """
 
 from __future__ import annotations
@@ -10,9 +18,9 @@ from __future__ import annotations
 from typing import Dict, FrozenSet, Optional
 
 
-UEFN_TOOL_POLICY_REVISION = "UEFN-v42-CL-56878558"
+UEFN_TOOL_POLICY_REVISION = "UEFN-v42.40-CL-59247843"
 CREATOR_EXPOSED_TOOLSET_COUNT = 29
-CREATOR_EXPOSED_TOOL_COUNT = 384
+CREATOR_EXPOSED_TOOL_COUNT = 386
 
 
 CREATOR_EXPOSED_TOOLS: Dict[str, FrozenSet[str]] = {
@@ -170,6 +178,7 @@ CREATOR_EXPOSED_TOOLS: Dict[str, FrozenSet[str]] = {
         "BindWidgetPropertyToVerseField",
         "DuplicateVerseField",
         "EditVerseField",
+        "GetSupportedVerseFieldTypes",
         "ListVerseFields",
         "RemoveVerseField",
     }),
@@ -385,13 +394,10 @@ CREATOR_EXPOSED_TOOLS: Dict[str, FrozenSet[str]] = {
         "add_actors_to_data_layer",
         "add_to_scene_from_asset",
         "add_to_scene_from_class",
-        "commit_level_instance",
         "create_data_layer_asset",
         "create_level",
-        "create_level_instance",
         "delete_folder",
         "diff",
-        "edit_level_instance",
         "find_actors",
         "get_actor_asset_path",
         "get_actors_in_data_layer",
@@ -400,13 +406,17 @@ CREATOR_EXPOSED_TOOLS: Dict[str, FrozenSet[str]] = {
         "get_current_level",
         "get_data_layers",
         "get_folders",
+        "is_actor_hidden",
         "load_actors",
         "load_level",
         "remove_actors_from_data_layer",
         "remove_from_scene",
         "rename_folder",
+        "replace_actors_with_asset",
+        "replace_actors_with_class",
         "save_actor",
         "set_actor_folder",
+        "set_actor_hidden",
         "trace_world",
         "unload_actors",
     }),
@@ -487,3 +497,36 @@ def is_tool_allowed(toolset_name: str, tool_name: str) -> bool:
         return False
     short_name = short_tool_name(toolset_name, tool_name)
     return short_name is not None and short_name in allowed_tools
+
+
+SAVE_ALL_GUARDED_TOOLS = frozenset({
+    ("editor_toolset.toolsets.asset.AssetTools", "save_assets"),
+})
+
+
+def check_unscoped_save(
+    toolset_name: str,
+    tool_name: str,
+    arguments: Optional[dict],
+    allow_save_all: bool = False,
+) -> None:
+    """Refuse an AssetTools.save_assets call that would save every dirty asset.
+
+    UEFN saves every unsaved asset in the project, other people's work
+    included, when save_assets gets an empty path list. Callers must name the
+    assets they changed, or pass allow_save_all=True on purpose.
+    """
+    short_name = short_tool_name(toolset_name, tool_name)
+    if (toolset_name, short_name) not in SAVE_ALL_GUARDED_TOOLS or allow_save_all:
+        return
+    paths = (arguments or {}).get("asset_paths")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or not all(isinstance(path, str) and path.strip() for path in paths)
+    ):
+        raise ValueError(
+            "save_assets needs a non-empty asset_paths list of the assets you "
+            "changed: an empty list saves every unsaved asset in the project. "
+            "Pass allow_save_all=true only when saving everything is intended."
+        )

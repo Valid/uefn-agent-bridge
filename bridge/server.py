@@ -62,7 +62,7 @@ try:
         is_tool_allowed,
         short_tool_name,
     )
-    from .uefn_tool_policy import UEFN_TOOL_POLICY_REVISION
+    from .uefn_tool_policy import UEFN_TOOL_POLICY_REVISION, check_unscoped_save
     from . import updates
 except ImportError:
     # Execute Python Script loads this file outside the bridge package.
@@ -73,7 +73,10 @@ except ImportError:
         is_tool_allowed,
         short_tool_name,
     )
-    from uefn_tool_policy import UEFN_TOOL_POLICY_REVISION  # type: ignore
+    from uefn_tool_policy import (  # type: ignore
+        UEFN_TOOL_POLICY_REVISION,
+        check_unscoped_save,
+    )
     import updates  # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -87,7 +90,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -604,8 +607,10 @@ def _cmd_toolsets_call(
     tool_name: str,
     arguments: Optional[dict] = None,
     allow_mcp_fallback: bool = True,
+    allow_save_all: bool = False,
 ) -> Any:
     """Call a tool locally, falling back to UEFN MCP only if unavailable."""
+    check_unscoped_save(toolset_name, tool_name, arguments, allow_save_all)
     return _start_local_tool_call(
         toolset_name,
         tool_name,
@@ -768,7 +773,9 @@ def _cmd_mcp_call(
     tool_name: str,
     arguments: Optional[dict] = None,
     _timeout_s: float = MCP_REQUEST_TIMEOUT_S,
+    allow_save_all: bool = False,
 ) -> Any:
+    check_unscoped_save(toolset_name, tool_name, arguments, allow_save_all)
     return _get_mcp_client().call_tool(
         toolset_name, tool_name, arguments, timeout=_timeout_s
     )
