@@ -117,6 +117,26 @@ class HybridServerTests(unittest.TestCase):
             [("ValkyrieToolset.SessionToolset", "GetSessionStatus", {})],
         )
 
+    def test_unscoped_save_is_refused_before_any_dispatch(self):
+        class RecordingClient:
+            calls = []
+
+            def call_tool(self, *args, **kwargs):
+                self.calls.append(args)
+
+        client = RecordingClient()
+        server._mcp_client = client
+        asset_tools = "editor_toolset.toolsets.asset.AssetTools"
+        with self.assertRaises(ValueError):
+            server._cmd_toolsets_call(asset_tools, "save_assets", {"asset_paths": []})
+        with self.assertRaises(ValueError):
+            server._cmd_mcp_call(asset_tools, "save_assets", {})
+        self.assertEqual(FakeRegistry.calls, [])
+        self.assertEqual(client.calls, [])
+
+        server._cmd_mcp_call(asset_tools, "save_assets", {}, allow_save_all=True)
+        self.assertEqual(len(client.calls), 1)
+
     def test_hidden_toolset_is_sent_to_policy_enforcing_mcp(self):
         result = server._start_local_tool_call(
             "Hidden.EditorToolset", "Dangerous", {}

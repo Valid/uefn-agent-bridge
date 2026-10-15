@@ -411,7 +411,7 @@ serialized.
 
 ### UEFN-specific friendly aliases
 
-The following 42 aliases call Epic's in-process Toolset Registry first and use
+The following 71 aliases call Epic's in-process Toolset Registry first and use
 the official MCP server only on a safe capability miss:
 
 | Domain | Commands |
@@ -421,6 +421,9 @@ the official MCP server only on a safe capability miss:
 | PIC session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log` |
 | Devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding` |
 | Scene Graph entities | `entities.set_transform`, `entities.set_component_property`, `entities.remove_component`, `entities.list_classes`, `entities.list_component_properties`, `entities.list_component_classes`, `entities.get_transform`, `entities.get_components`, `entities.get_component_property`, `entities.find`, `entities.delete`, `entities.create`, `entities.add_component` |
+| Widget Blueprints | `widgets.list_blueprints`, `widgets.list_classes`, `widgets.class_info`, `widgets.describe`, `widgets.tree`, `widgets.named_slots`, `widgets.create_blueprint`, `widgets.compile`, `widgets.add`, `widgets.remove`, `widgets.rename`, `widgets.move`, `widgets.wrap`, `widgets.replace_with_template`, `widgets.set_named_slot_content` |
+| Widget Verse fields | `widgets.verse_field_types`, `widgets.verse_fields`, `widgets.add_verse_field`, `widgets.duplicate_verse_field`, `widgets.edit_verse_field`, `widgets.remove_verse_field`, `widgets.bind_verse_field` |
+| Widget view bindings (MVVM) | `widgets.view_bindings`, `widgets.view_events`, `widgets.bindable_properties`, `widgets.conversion_functions`, `widgets.create_view_binding`, `widgets.create_view_event_binding`, `widgets.remove_view_binding` |
 
 Pass each official tool's arguments directly inside bridge `params`. Inspect the
 schema first when parameter names or reference shapes are not already known.
@@ -436,10 +439,53 @@ expects a plain string.
 }
 ```
 
+### Widget Blueprints and Verse UI
+
+The `widgets.*` aliases wrap Epic's `UMGToolSet`, `VerseFieldsToolset` and
+`MVVMToolset`, which build a UMG screen, give it Verse fields and bind them.
+Facts below were checked on UEFN 42.40 (CL 59247843).
+
+- Read before changing: `widgets.tree`, `widgets.verse_fields`,
+  `widgets.view_bindings`, `widgets.named_slots` (the Python client's
+  `inspect_widget(path)` runs all four). Blueprint arguments are
+  `{"widgetBlueprint": {"refPath": "/Mount/Folder/UW_Menu.UW_Menu"}}`; a widget
+  in it is `/Mount/Folder/UW_Menu.UW_Menu:WidgetTree.<WidgetName>`.
+- Call `ObjectTools.list_properties` on a widget or slot before
+  `set_properties`. Wrong property names fail silently.
+- `widgets.verse_field_types` lists what `widgets.add_verse_field` accepts. On
+  42.40 that is `bool, int, float, string, message, color, color_alpha,
+  texture, material, event`, with event parameters `bool, int, float` and at
+  most one parameter per event. The `spec` object is
+  `{"type": "event", "eventParameterTypes": ["int"], "defaultValue": "",
+  "visibility": "Public", "writeAccess": "", "bIsVar": false}`. Epic's Verse UI
+  Kit guide says `AddVerseField` cannot create events; on 42.40 it can.
+- **A blueprint made by `widgets.create_blueprint` never reflects its Verse
+  fields on 42.40.** The fields list fine, but after saving and `verse.build`
+  the generated Verse class is empty (also reported on Epic's forum). Instead,
+  copy a blueprint that already reflects fields with `assets.duplicate`, remove
+  its fields and add yours; the new fields reflect.
+- `widgets.compile` neither saves nor dirties the asset. Save with
+  `toolsets.call` → `editor_toolset.toolsets.asset.AssetTools.save_assets`
+  and `{"asset_paths": ["/Mount/Folder/UW_Menu"]}`, then `verse.build`, then
+  check the project's asset digest for the fields before writing Verse.
+- **`save_assets` with an empty list saves every unsaved asset in the
+  project.** `toolsets.call` and `mcp.call` refuse an empty or missing
+  `asset_paths` unless the request sets `"allow_save_all": true`.
+- Only the editor panels can set the number each button sends on a shared
+  event (`Param0` in View Bindings), conversion-function values, `message`
+  field defaults and animation keyframes: list those for the user.
+- New 42.40 dialogs block the editor: an "Unreal Editor Security" trust
+  prompt when a project opens, and a toast asking to enable Python Editor
+  Scripting locally. The bridge does not start until Python is enabled; Epic's
+  MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN` (the
+  `uefn.enable_python` alias, reached through MCP) enables it without the GUI,
+  asynchronously. It is a project setting: ask before changing it.
+
 ### Generic creator-toolset commands
 
-Local routing is pinned to the exact creator-exposed policy from UEFN v42,
-revision `UEFN-v42-CL-56878558`: 29 approved toolsets and 384 approved tools.
+Local routing is pinned to the exact creator-exposed policy from UEFN 42.40,
+revision `UEFN-v42.40-CL-59247843`: 29 approved toolsets and 386 approved tools.
+Epic's new `ProgrammaticToolset` (`execute_tool_script`) is left out on purpose.
 The bridge does not expose registered editor-internal tools through the local
 path.
 
