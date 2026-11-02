@@ -12,11 +12,14 @@ from bridge.routes import (
     is_tool_allowed,
     short_tool_name,
 )
-from bridge.routes import default_deadline_s
+from bridge.routes import default_deadline_s, route_candidates
 from bridge.uefn_tool_policy import (
     CREATOR_EXPOSED_TOOLSET_COUNT,
     CREATOR_EXPOSED_TOOL_COUNT,
     CREATOR_EXPOSED_TOOLS,
+    POLICY_SNAPSHOT_COUNTS,
+    POLICY_SNAPSHOTS,
+    UEFN_TOOL_POLICY_REVISION,
     check_unscoped_save,
 )
 
@@ -93,6 +96,78 @@ class RouteTests(unittest.TestCase):
                 "execute_tool_script",
             )
         )
+
+
+class Uefn43RenameTests(unittest.TestCase):
+    """UEFN 43.00 (CL 59596594) renamed the creator toolsets."""
+
+    def test_each_pinned_snapshot_matches_its_recorded_counts(self):
+        self.assertEqual(set(POLICY_SNAPSHOTS), set(POLICY_SNAPSHOT_COUNTS))
+        for revision, snapshot in POLICY_SNAPSHOTS.items():
+            with self.subTest(revision=revision):
+                self.assertEqual(
+                    (len(snapshot), sum(len(tools) for tools in snapshot.values())),
+                    POLICY_SNAPSHOT_COUNTS[revision],
+                )
+        self.assertEqual(UEFN_TOOL_POLICY_REVISION, "UEFN-v43.00-CL-59596594")
+
+    def test_aliases_name_the_43_toolsets(self):
+        self.assertEqual(TOOLSET_ROUTES["verse.build"], ("VerseToolset.VerseToolset", "BuildAll"))
+        self.assertEqual(
+            TOOLSET_ROUTES["session.status"],
+            ("ValkyrieFortniteToolset.SessionToolset", "GetSessionStatus"),
+        )
+        self.assertEqual(
+            TOOLSET_ROUTES["devices.place"],
+            ("ValkyrieFortniteToolset.DeviceToolset", "PlaceDevice"),
+        )
+        self.assertEqual(
+            TOOLSET_ROUTES["session.verse_output"],
+            ("ValkyrieFortniteToolset.SessionToolset", "GetVerseOutput"),
+        )
+        self.assertIn("session.verse_output", READ_ONLY_TOOL_ROUTES)
+        self.assertNotIn("devices.set_classic_option", READ_ONLY_TOOL_ROUTES)
+
+    def test_every_alias_also_reaches_a_42_name_when_one_existed(self):
+        legacy = POLICY_SNAPSHOTS["UEFN-v42.40-CL-59247843"]
+        current = POLICY_SNAPSHOTS["UEFN-v43.00-CL-59596594"]
+        for alias, route in TOOLSET_ROUTES.items():
+            with self.subTest(alias=alias):
+                candidates = route_candidates(*route)
+                self.assertEqual(candidates[0], route)
+                in_43 = route[1] in current.get(route[0], ())
+                in_42 = any(tool in legacy.get(toolset, ()) for toolset, tool in candidates)
+                # Every alias works on at least one pinned build.
+                self.assertTrue(in_43 or in_42)
+
+    def test_candidates_go_both_ways(self):
+        self.assertEqual(
+            route_candidates("VerseToolset.VerseToolset", "BuildAll"),
+            [("VerseToolset.VerseToolset", "BuildAll"), ("ValkyrieToolset.VerseToolset", "BuildAll")],
+        )
+        self.assertEqual(
+            route_candidates("ValkyrieToolset.SessionToolset", "GetSessionStatus"),
+            [("ValkyrieToolset.SessionToolset", "GetSessionStatus"),
+             ("ValkyrieFortniteToolset.SessionToolset", "GetSessionStatus")],
+        )
+        python = "ValkyrieToolset.ValkyriePythonToolset"
+        self.assertEqual(
+            route_candidates(python, "IsPythonReadyForMainProject"),
+            [(python, "IsPythonReadyForMainProject"), (python, "IsPythonEnabledInUEFN")],
+        )
+        self.assertEqual(
+            route_candidates("EditorToolset.ObjectToolset", "GetProperties"),
+            [("EditorToolset.ObjectToolset", "GetProperties")],
+        )
+
+    def test_legacy_slow_tool_keeps_its_deadline(self):
+        legacy_build = {"toolset_name": "ValkyrieToolset.VerseToolset", "tool_name": "BuildAll"}
+        self.assertEqual(default_deadline_s("toolsets.call", legacy_build), 600.0)
+        self.assertEqual(default_deadline_s("verse.build"), 600.0)
+
+    def test_scripting_toolsets_stay_out_of_43_policy(self):
+        self.assertNotIn("editor_toolset.toolsets.python_scripting.PythonScriptingTools", CREATOR_EXPOSED_TOOLS)
+        self.assertNotIn("editor_toolset.toolsets.programmatic.ProgrammaticToolset", CREATOR_EXPOSED_TOOLS)
 
 
 class UnscopedSaveGuardTests(unittest.TestCase):

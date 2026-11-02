@@ -137,6 +137,77 @@ class HybridServerTests(unittest.TestCase):
         server._cmd_mcp_call(asset_tools, "save_assets", {}, allow_save_all=True)
         self.assertEqual(len(client.calls), 1)
 
+    def test_43_route_runs_the_42_toolset_on_a_42_editor(self):
+        pending = server._start_local_tool_call(
+            "ValkyrieFortniteToolset.SessionToolset", "GetSessionStatus", {}
+        )
+        self.assertIsInstance(pending, server._PendingRegistryCall)
+        self.assertEqual(
+            FakeRegistry.calls,
+            [("ValkyrieToolset.SessionToolset", "GetSessionStatus", {})],
+        )
+
+    def test_42_route_runs_the_43_toolset_on_a_43_editor(self):
+        original = FakeRegistry.schemas
+        try:
+            FakeRegistry.schemas = [{
+                "name": "ValkyrieFortniteToolset.SessionToolset",
+                "version": "1.0",
+                "tools": [{"name": "ValkyrieFortniteToolset.SessionToolset.GetSessionStatus"}],
+            }]
+            FakeRegistry.registered = {"ValkyrieFortniteToolset.SessionToolset"}
+            for toolset in ("ValkyrieToolset.SessionToolset", "ValkyrieFortniteToolset.SessionToolset"):
+                server._start_local_tool_call(toolset, "GetSessionStatus", {})
+        finally:
+            FakeRegistry.schemas = original
+        self.assertEqual(
+            FakeRegistry.calls,
+            [("ValkyrieFortniteToolset.SessionToolset", "GetSessionStatus", {})] * 2,
+        )
+
+    def test_mcp_fallback_picks_the_toolset_the_server_lists(self):
+        class ListingClient:
+            calls = []
+
+            def list_toolsets(self, timeout=None):
+                return {"toolsets": [{"name": "VerseToolset.VerseToolset"}]}
+
+            def call_tool(self, toolset, tool, arguments, timeout=None):
+                self.calls.append((toolset, tool))
+                return {"returnValue": []}
+
+        client = ListingClient()
+        server._mcp_client = client
+        FakeRegistry.available = False
+        fallback = server._start_local_tool_call("ValkyrieToolset.VerseToolset", "BuildAll", {})
+        self.assertIsInstance(fallback, server._MCPFallback)
+        response = server._execute_mcp_fallback(fallback)
+        self.assertTrue(response["ok"])
+        self.assertEqual(client.calls, [("VerseToolset.VerseToolset", "BuildAll")])
+
+    def test_mcp_fallback_describes_a_shared_toolset_to_pick_the_tool(self):
+        python = "ValkyrieToolset.ValkyriePythonToolset"
+
+        class DescribingClient:
+            calls = []
+
+            def list_toolsets(self, timeout=None):
+                return {"toolsets": [{"name": python}]}
+
+            def describe_toolset(self, name, timeout=None):
+                return {"name": name, "tools": [{"name": python + ".IsPythonEnabledInUEFN"}]}
+
+            def call_tool(self, toolset, tool, arguments, timeout=None):
+                self.calls.append((toolset, tool))
+                return {"returnValue": True}
+
+        client = DescribingClient()
+        server._mcp_client = client
+        FakeRegistry.available = False
+        fallback = server._start_local_tool_call(python, "IsPythonReadyForMainProject", {})
+        server._execute_mcp_fallback(fallback)
+        self.assertEqual(client.calls, [(python, "IsPythonEnabledInUEFN")])
+
     def test_hidden_toolset_is_sent_to_policy_enforcing_mcp(self):
         result = server._start_local_tool_call(
             "Hidden.EditorToolset", "Dangerous", {}

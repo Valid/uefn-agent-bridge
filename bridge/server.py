@@ -37,7 +37,7 @@ import traceback
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Execute Python Script does not consistently add the script directory to
 # sys.path. Resolve it before importing sibling bridge modules.
@@ -60,6 +60,7 @@ try:
         UEFN_EXPOSED_TOOLSETS,
         default_deadline_s,
         is_tool_allowed,
+        route_candidates,
         short_tool_name,
     )
     from .uefn_tool_policy import UEFN_TOOL_POLICY_REVISION, check_unscoped_save
@@ -71,6 +72,7 @@ except ImportError:
         UEFN_EXPOSED_TOOLSETS,
         default_deadline_s,
         is_tool_allowed,
+        route_candidates,
         short_tool_name,
     )
     from uefn_tool_policy import (  # type: ignore
@@ -90,7 +92,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -301,12 +303,16 @@ class _MCPFallback:
         tool_name: str = "",
         arguments: Optional[dict] = None,
         reason: str = "",
+        candidates: Optional[List[Tuple[str, str]]] = None,
     ) -> None:
         self.operation = operation
         self.toolset_name = toolset_name
         self.tool_name = tool_name
         self.arguments = arguments or {}
         self.reason = reason
+        # The same tool under other UEFN builds' names, tried in order when
+        # the editor's MCP server does not list toolset_name (pre-dispatch).
+        self.candidates = candidates or []
         self.command = ""
         self.started_mono = time.monotonic()
 
@@ -483,6 +489,78 @@ def _get_local_toolset_schemas(refresh: bool = False) -> List[dict]:
     return _toolset_schema_cache
 
 
+def _exposes(schemas: List[dict], toolset_name: str, tool_name: str) -> bool:
+    described = next(
+        (item for item in schemas if item.get("name") == toolset_name), None
+    )
+    return described is not None and any(
+        short_tool_name(toolset_name, tool.get("name", "")) == tool_name
+        for tool in described.get("tools", [])
+        if isinstance(tool, dict)
+    )
+
+
+def _pick_local_route(candidates: List[Tuple[str, str]]) -> Tuple[str, str]:
+    """The first candidate route the running editor's registry exposes.
+
+    UEFN 43.00 renamed toolsets (ValkyrieToolset.VerseToolset became
+    VerseToolset.VerseToolset, and so on), so a route can name a toolset this
+    editor does not have. Falls back to the first candidate, which then fails
+    the usual checks with their usual messages.
+    """
+    try:
+        schemas = _get_local_toolset_schemas()
+    except Exception:
+        return candidates[0]
+    for toolset_name, tool_name in candidates:
+        if _exposes(schemas, toolset_name, tool_name):
+            return toolset_name, tool_name
+    return candidates[0]
+
+
+def _listed_toolset_names(listing: Any) -> List[str]:
+    items = listing.get("toolsets", []) if isinstance(listing, dict) else listing
+    if not isinstance(items, list):
+        return []
+    return [
+        item.get("name", "") if isinstance(item, dict) else str(item)
+        for item in items
+    ]
+
+
+def _pick_mcp_route(
+    client: Any, fallback: "_MCPFallback", timeout_s: float
+) -> Tuple[str, str]:
+    """The first candidate route the editor's MCP server lists.
+
+    Runs only discovery requests (list_toolsets, describe_toolset), so nothing
+    has been dispatched yet when it picks. Any discovery failure keeps the
+    route the caller named.
+    """
+    named = (fallback.toolset_name, fallback.tool_name)
+    if len(fallback.candidates) < 2:
+        return named
+    try:
+        listed = set(_listed_toolset_names(client.list_toolsets(timeout=timeout_s)))
+        present = [c for c in fallback.candidates if c[0] in listed]
+        if not present:
+            return named
+        if len({toolset for toolset, _ in present}) == len(present):
+            return present[0]
+        described: Dict[str, Any] = {}
+        for toolset_name, tool_name in present:
+            if toolset_name not in described:
+                described[toolset_name] = client.describe_toolset(
+                    toolset_name, timeout=timeout_s
+                )
+            schema = described[toolset_name]
+            if isinstance(schema, dict) and _exposes([schema], toolset_name, tool_name):
+                return toolset_name, tool_name
+    except Exception:
+        return named
+    return named
+
+
 def _start_local_tool_call(
     toolset_name: str,
     tool_name: str,
@@ -499,6 +577,9 @@ def _start_local_tool_call(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Tool arguments are not valid JSON: {exc}") from exc
     tool_name = short_tool_name(toolset_name, tool_name)
+    candidates = route_candidates(toolset_name, tool_name) if tool_name else []
+    if len(candidates) > 1:
+        toolset_name, tool_name = _pick_local_route(candidates)
     try:
         if tool_name is None or not is_tool_allowed(toolset_name, tool_name):
             raise _LocalRegistryUnavailable(
@@ -533,6 +614,7 @@ def _start_local_tool_call(
                 tool_name=tool_name,
                 arguments=arguments,
                 reason=str(exc),
+                candidates=candidates,
             )
         raise
     except Exception as exc:
@@ -543,6 +625,7 @@ def _start_local_tool_call(
                 tool_name=tool_name,
                 arguments=arguments,
                 reason=str(exc),
+                candidates=candidates,
             )
         raise
 
@@ -713,9 +796,10 @@ def _execute_mcp_fallback(
                 fallback.toolset_name, timeout=timeout_s
             )
         elif fallback.operation == "call":
+            toolset_name, tool_name = _pick_mcp_route(client, fallback, timeout_s)
             result = client.call_tool(
-                fallback.toolset_name,
-                fallback.tool_name,
+                toolset_name,
+                tool_name,
                 fallback.arguments,
                 timeout=timeout_s,
             )

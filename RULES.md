@@ -443,7 +443,9 @@ expects a plain string.
 
 The `widgets.*` aliases wrap Epic's `UMGToolSet`, `VerseFieldsToolset` and
 `MVVMToolset`, which build a UMG screen, give it Verse fields and bind them.
-Facts below were checked on UEFN 42.40 (CL 59247843).
+Facts below were checked on UEFN 42.40 (CL 59247843). On 43.00, `widgets.describe` is gone
+(Epic removed `GetWidgetDescription`) and `AssetToolset.SaveAsset` with
+`{"assetPath": "/Mount/Folder/UW_Menu"}` replaces `save_assets`.
 
 - Read before changing: `widgets.tree`, `widgets.verse_fields`,
   `widgets.view_bindings`, `widgets.named_slots` (the Python client's
@@ -477,15 +479,27 @@ Facts below were checked on UEFN 42.40 (CL 59247843).
 - New 42.40 dialogs block the editor: an "Unreal Editor Security" trust
   prompt when a project opens, and a toast asking to enable Python Editor
   Scripting locally. The bridge does not start until Python is enabled; Epic's
-  MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN` (the
+  MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN`
+  (`EnablePythonForMainProject` on 43.00; the
   `uefn.enable_python` alias, reached through MCP) enables it without the GUI,
   asynchronously. It is a project setting: ask before changing it.
 
 ### Generic creator-toolset commands
 
-Local routing is pinned to the exact creator-exposed policy from UEFN 42.40,
-revision `UEFN-v42.40-CL-59247843`: 29 approved toolsets and 386 approved tools.
-Epic's new `ProgrammaticToolset` (`execute_tool_script`) is left out on purpose.
+Local routing is pinned to the exact creator-exposed policy of each supported
+build: `UEFN-v42.40-CL-59247843` (29 toolsets, 386 tools) and
+`UEFN-v43.00-CL-59596594` (54 toolsets, 819 tools). A tool runs locally only
+when a snapshot lists it and the running editor exposes it. Epic's
+`ProgrammaticToolset` (`execute_tool_script`) and 43.00's `PythonScriptingTools`
+are left out on purpose.
+
+UEFN 43.00 renamed the toolsets the aliases use: `VerseToolset.VerseToolset`,
+`ValkyrieFortniteToolset.SessionToolset`, `ValkyrieFortniteToolset.DeviceToolset`,
+`ConsoleToolset.LogsToolset`, and the Python tools `IsPythonReadyForMainProject`
+and `EnablePythonForMainProject`. Aliases and `toolsets.call` accept either
+build's name for these and run the one the editor exposes. `editor_toolset.toolsets.*`
+became `EditorToolset.*` with new tool names and arguments; call those by the
+running build's exact name.
 The bridge does not expose registered editor-internal tools through the local
 path.
 
@@ -501,7 +515,7 @@ Use exact names because tool names can collide between toolsets:
 {
   "command": "toolsets.call",
   "params": {
-    "toolset_name": "ValkyrieToolset.SessionToolset",
+    "toolset_name": "ValkyrieFortniteToolset.SessionToolset",
     "tool_name": "GetSessionStatus",
     "arguments": {},
     "allow_mcp_fallback": true
