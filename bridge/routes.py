@@ -8,7 +8,7 @@ local registry capability is unavailable.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     from .uefn_tool_policy import (
@@ -74,24 +74,47 @@ PYTHON_COMMANDS = frozenset({
 })
 
 
+# UEFN 43.00 names. Epic renamed the Verse, session and device toolsets in
+# 43.00; every route also reaches its 42.x name on an older editor (see
+# LEGACY_TOOLSET_NAMES and route_candidates below).
 _PYTHON_TOOLSET = "ValkyrieToolset.ValkyriePythonToolset"
-_VERSE_TOOLSET = "ValkyrieToolset.VerseToolset"
-_SESSION_TOOLSET = "ValkyrieToolset.SessionToolset"
-_DEVICE_TOOLSET = "ValkyrieToolset.DeviceToolset"
+_VERSE_TOOLSET = "VerseToolset.VerseToolset"
+_SESSION_TOOLSET = "ValkyrieFortniteToolset.SessionToolset"
+_DEVICE_TOOLSET = "ValkyrieFortniteToolset.DeviceToolset"
 _ENTITY_TOOLSET = "ValkyrieToolset.EntityToolset"
 _UMG_TOOLSET = "UMGToolSet.UMGToolSet"
 _VERSE_FIELDS_TOOLSET = "VerseFieldsToolset.VerseFieldsToolset"
 _MVVM_TOOLSET = "MVVMToolset.MVVMToolset"
 
 
-# Friendly bridge aliases for the 42 UEFN-specific tools shipped in v42, plus
-# the widget tools a UMG screen needs (widget tree, Verse fields and view
-# bindings; see "Widget Blueprints and Verse UI" in RULES.md). The other
-# generic toolsets remain available through toolsets.call without inflating the
-# command list or forcing schema discovery into every agent context.
+# 43.00 toolset name -> the 42.x name of the same toolset. Only renames whose
+# tool names and arguments stayed the same belong here, so a call can move
+# between them unchanged. (editor_toolset.toolsets.* -> EditorToolset.* also
+# renamed every tool to PascalCase, so callers must use the right build's
+# names there.)
+LEGACY_TOOLSET_NAMES: Dict[str, str] = {
+    _VERSE_TOOLSET: "ValkyrieToolset.VerseToolset",
+    _SESSION_TOOLSET: "ValkyrieToolset.SessionToolset",
+    _DEVICE_TOOLSET: "ValkyrieToolset.DeviceToolset",
+    "ConsoleToolset.LogsToolset": "EditorToolset.LogsToolset",
+}
+
+# 43.00 tool -> the 42.x tool it replaced, where the name changed.
+LEGACY_TOOL_ROUTES: Dict[ToolRoute, ToolRoute] = {
+    (_PYTHON_TOOLSET, "IsPythonReadyForMainProject"): (_PYTHON_TOOLSET, "IsPythonEnabledInUEFN"),
+    (_PYTHON_TOOLSET, "EnablePythonForMainProject"): (_PYTHON_TOOLSET, "EnablePythonInUEFN"),
+}
+
+
+# Friendly bridge aliases for the UEFN-specific tools (42 in v42, plus the
+# tools 43.00 added), plus the widget tools a UMG screen needs (widget tree,
+# Verse fields and view bindings; see "Widget Blueprints and Verse UI" in
+# RULES.md). The other generic toolsets remain available through toolsets.call
+# without inflating the command list or forcing schema discovery into every
+# agent context.
 TOOLSET_ROUTES: Dict[str, ToolRoute] = {
-    "uefn.python_enabled": (_PYTHON_TOOLSET, "IsPythonEnabledInUEFN"),
-    "uefn.enable_python": (_PYTHON_TOOLSET, "EnablePythonInUEFN"),
+    "uefn.python_enabled": (_PYTHON_TOOLSET, "IsPythonReadyForMainProject"),
+    "uefn.enable_python": (_PYTHON_TOOLSET, "EnablePythonForMainProject"),
 
     "verse.write_file": (_VERSE_TOOLSET, "WriteFile"),
     "verse.replace": (_VERSE_TOOLSET, "Replace"),
@@ -102,6 +125,7 @@ TOOLSET_ROUTES: Dict[str, ToolRoute] = {
     "verse.delete": (_VERSE_TOOLSET, "Delete"),
     "verse.create_directory": (_VERSE_TOOLSET, "CreateDirectory"),
     "verse.copy": (_VERSE_TOOLSET, "Copy"),
+    "verse.file_tree": (_VERSE_TOOLSET, "FileTree"),
     "verse.build": (_VERSE_TOOLSET, "BuildAll"),
 
     "session.stop": (_SESSION_TOOLSET, "StopSession"),
@@ -112,6 +136,7 @@ TOOLSET_ROUTES: Dict[str, ToolRoute] = {
     "session.status": (_SESSION_TOOLSET, "GetSessionStatus"),
     "session.game_state": (_SESSION_TOOLSET, "GetGameState"),
     "session.client_log": (_SESSION_TOOLSET, "GetClientLogEntries"),
+    "session.verse_output": (_SESSION_TOOLSET, "GetVerseOutput"),
 
     "devices.set_property": (_DEVICE_TOOLSET, "SetDeviceProperty"),
     "devices.remove_event_binding": (_DEVICE_TOOLSET, "RemoveEventBinding"),
@@ -122,6 +147,9 @@ TOOLSET_ROUTES: Dict[str, ToolRoute] = {
     "devices.get_properties": (_DEVICE_TOOLSET, "GetDeviceProperties"),
     "devices.get_binding_options": (_DEVICE_TOOLSET, "GetBindingOptions"),
     "devices.add_event_binding": (_DEVICE_TOOLSET, "AddEventBinding"),
+    "devices.list_classic_options": (_DEVICE_TOOLSET, "ListClassicDeviceOptions"),
+    "devices.get_classic_option_values": (_DEVICE_TOOLSET, "GetClassicDeviceOptionValues"),
+    "devices.set_classic_option": (_DEVICE_TOOLSET, "SetClassicDeviceOption"),
 
     "entities.set_transform": (_ENTITY_TOOLSET, "SetEntityTransform"),
     "entities.set_component_property": (_ENTITY_TOOLSET, "SetComponentProperty"),
@@ -179,14 +207,18 @@ READ_ONLY_TOOL_ROUTES = frozenset({
     "verse.read_file",
     "verse.list_files",
     "verse.grep",
+    "verse.file_tree",
     "session.status",
     "session.game_state",
     "session.client_log",
+    "session.verse_output",
     "devices.list_event_bindings",
     "devices.list_properties",
     "devices.list_assets",
     "devices.get_properties",
     "devices.get_binding_options",
+    "devices.list_classic_options",
+    "devices.get_classic_option_values",
     "entities.list_classes",
     "entities.list_component_properties",
     "entities.list_component_classes",
@@ -237,9 +269,36 @@ def default_deadline_s(command: str, params: Optional[dict] = None, fallback: fl
         tool = short_tool_name(toolset, params.get("tool_name"))
         if tool:
             route = (toolset, tool)
-    return SLOW_TOOL_DEADLINES_S.get(route, fallback) if route else fallback
+    if not route:
+        return fallback
+    for candidate in route_candidates(*route):
+        if candidate in SLOW_TOOL_DEADLINES_S:
+            return SLOW_TOOL_DEADLINES_S[candidate]
+    return fallback
 
 
 def resolve_tool_route(command: str) -> Optional[ToolRoute]:
     """Return the native toolset route for a friendly bridge command."""
     return TOOLSET_ROUTES.get(command)
+
+
+_CURRENT_TOOLSET_NAMES = {legacy: current for current, legacy in LEGACY_TOOLSET_NAMES.items()}
+_CURRENT_TOOL_ROUTES = {legacy: current for current, legacy in LEGACY_TOOL_ROUTES.items()}
+
+
+def route_candidates(toolset_name: str, tool_name: str) -> List[ToolRoute]:
+    """The same tool under every UEFN build's names, the given route first.
+
+    A route named for 43.00 also yields its 42.x name, and a 42.x route yields
+    its 43.00 name, so callers can use either and the bridge picks the one the
+    running editor exposes.
+    """
+    route = (toolset_name, tool_name)
+    candidates = [route]
+    for other in (LEGACY_TOOL_ROUTES.get(route), _CURRENT_TOOL_ROUTES.get(route)):
+        if other and other not in candidates:
+            candidates.append(other)
+    for name in (LEGACY_TOOLSET_NAMES.get(toolset_name), _CURRENT_TOOLSET_NAMES.get(toolset_name)):
+        if name and (name, tool_name) not in candidates:
+            candidates.append((name, tool_name))
+    return candidates

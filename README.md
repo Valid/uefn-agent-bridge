@@ -1,6 +1,6 @@
 # UEFN Agent Bridge: control Unreal Editor for Fortnite from AI agents, scripts and CI
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42](https://img.shields.io/badge/UEFN-v42-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![UEFN v42.40 and v43.00](https://img.shields.io/badge/UEFN-v42.40%20%7C%20v43.00-informational) ![Python 3.11 in UEFN](https://img.shields.io/badge/python-3.11%20(embedded)-informational)
 
 *Formerly `uefn-python-bridge`; old links and clones redirect here.*
 
@@ -27,7 +27,7 @@ It is a plain HTTP + JSON server with no dependencies beyond UEFN's embedded Pyt
 |---|---|
 | Spawn, move, duplicate, delete and inspect actors | `actors.spawn`, `actors.transform`, `actors.duplicate`, `actors.delete`, `actors.list`, `actors.properties` |
 | Find, import, rename and save assets | `assets.search`, `assets.import_task`, `assets.rename`, `assets.save` |
-| Place Creative devices and wire events | `devices.place`, `devices.set_property`, `devices.add_event_binding` |
+| Place Creative devices and wire events | `devices.place`, `devices.set_property`, `devices.add_event_binding`, `devices.list_classic_options`, `devices.get_classic_option_values`, `devices.set_classic_option` |
 | Edit Verse device `@editable` properties on placed devices | `verse.find_device`, `verse.get_properties`, `verse.set_property` |
 | Read, write, search and build Verse | `verse.read_file`, `verse.write_file`, `verse.grep`, `verse.build` |
 | Launch a play session, start a match, push changes | `session.start`, `session.start_game`, `session.push_changes`, `session.status` |
@@ -81,7 +81,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.6.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.7.0 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 92 commands registered
 ```
 
@@ -192,9 +192,9 @@ print(ue.last_route)  # toolset_registry or mcp
 
 # Generic approved tool lookup and call.
 toolsets = ue.toolsets()
-schema = ue.describe_toolset("ValkyrieToolset.SessionToolset")
+schema = ue.describe_toolset("ValkyrieFortniteToolset.SessionToolset")
 status = ue.call_tool(
-    "ValkyrieToolset.SessionToolset",
+    "ValkyrieFortniteToolset.SessionToolset",
     "GetSessionStatus",
 )
 
@@ -301,24 +301,39 @@ These direct `verse.*` commands inspect placed generated device objects. They ar
 
 ## UEFN-Specific Friendly Aliases
 
-Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable bridge command names. Version 0.6.0 adds 29 `widgets.*` aliases for Widget Blueprints, their Verse fields and view bindings (see "Widget Blueprints and Verse UI" in [`RULES.md`](RULES.md), including a 42.40 bug where a blueprint made by `widgets.create_blueprint` never reflects its Verse fields). Pass the official tool arguments directly as `params`.
+Version 0.3.0 maps all 42 UEFN-specific tools shipped with UEFN v42 to stable bridge command names. Version 0.6.0 adds 29 `widgets.*` aliases for Widget Blueprints, their Verse fields and view bindings (see "Widget Blueprints and Verse UI" in [`RULES.md`](RULES.md), including a 42.40 bug where a blueprint made by `widgets.create_blueprint` never reflects its Verse fields). Version 0.7.0 follows UEFN 43.00's toolset renames (see "UEFN 43.00 toolset renames" below) and adds `verse.file_tree`, `session.verse_output` and three `devices.*classic*` aliases. Pass the official tool arguments directly as `params`.
 
 | Domain | Friendly aliases |
 |---|---|
 | Python setup | `uefn.python_enabled`, `uefn.enable_python` |
-| Verse files and build | `verse.write_file`, `verse.replace`, `verse.read_file`, `verse.move`, `verse.list_files`, `verse.grep`, `verse.delete`, `verse.create_directory`, `verse.copy`, `verse.build` |
-| Play session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log` |
-| Creative devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding` |
+| Verse files and build | `verse.write_file`, `verse.replace`, `verse.read_file`, `verse.move`, `verse.list_files`, `verse.grep`, `verse.delete`, `verse.create_directory`, `verse.copy`, `verse.file_tree`, `verse.build` |
+| Play session | `session.stop`, `session.stop_game`, `session.start`, `session.start_game`, `session.push_changes`, `session.status`, `session.game_state`, `session.client_log`, `session.verse_output` |
+| Creative devices | `devices.set_property`, `devices.remove_event_binding`, `devices.place`, `devices.list_event_bindings`, `devices.list_properties`, `devices.list_assets`, `devices.get_properties`, `devices.get_binding_options`, `devices.add_event_binding`, `devices.list_classic_options`, `devices.get_classic_option_values`, `devices.set_classic_option` |
 | Scene Graph entities | `entities.set_transform`, `entities.set_component_property`, `entities.remove_component`, `entities.list_classes`, `entities.list_component_properties`, `entities.list_component_classes`, `entities.get_transform`, `entities.get_components`, `entities.get_component_property`, `entities.find`, `entities.delete`, `entities.create`, `entities.add_component` |
 | Widget Blueprints | `widgets.list_blueprints`, `widgets.list_classes`, `widgets.class_info`, `widgets.describe`, `widgets.tree`, `widgets.named_slots`, `widgets.create_blueprint`, `widgets.compile`, `widgets.add`, `widgets.remove`, `widgets.rename`, `widgets.move`, `widgets.wrap`, `widgets.replace_with_template`, `widgets.set_named_slot_content` |
 | Widget Verse fields | `widgets.verse_field_types`, `widgets.verse_fields`, `widgets.add_verse_field`, `widgets.duplicate_verse_field`, `widgets.edit_verse_field`, `widgets.remove_verse_field`, `widgets.bind_verse_field` |
 | Widget view bindings (MVVM) | `widgets.view_bindings`, `widgets.view_events`, `widgets.bindable_properties`, `widgets.conversion_functions`, `widgets.create_view_binding`, `widgets.create_view_event_binding`, `widgets.remove_view_binding` |
 
+### UEFN 43.00 toolset renames
+
+UEFN 43.00 (CL 59596594) renamed most of Epic's toolsets. The aliases name the 43.00 toolsets and fall back to the 42.40 names, so they work on either build:
+
+| 42.40 | 43.00 |
+|---|---|
+| `ValkyrieToolset.VerseToolset` | `VerseToolset.VerseToolset` (adds `FileTree`) |
+| `ValkyrieToolset.SessionToolset` | `ValkyrieFortniteToolset.SessionToolset` (adds `GetVerseOutput`) |
+| `ValkyrieToolset.DeviceToolset` | `ValkyrieFortniteToolset.DeviceToolset` (adds three classic-device option tools) |
+| `EditorToolset.LogsToolset` | `ConsoleToolset.LogsToolset` |
+| `ValkyriePythonToolset.IsPythonEnabledInUEFN`, `EnablePythonInUEFN` | `IsPythonReadyForMainProject`, `EnablePythonForMainProject` |
+| `editor_toolset.toolsets.*` (snake_case tools) | `EditorToolset.*` (PascalCase tools; `SceneTools` became `LevelToolset`) |
+
+A `toolsets.call` that names a renamed Verse, Session, Device, Logs or Python tool by either build's name runs the one the running editor exposes, locally or through MCP. The `editor_toolset.toolsets.*` tools changed names and argument shapes, so call those by the running build's exact name. `widgets.describe` (`GetWidgetDescription`) exists only on 42.40.
+
 Use `toolsets.describe` before the first unfamiliar call. Epic's JSON schema is the source of truth for parameter names, required fields, object reference shapes, and result values. When a schema requests an Unreal object reference, it commonly uses a JSON object such as `{"refPath":"/Path/To/Object"}`. Do not substitute that shape where a tool expects a plain string.
 
 ## Generic Creator Toolsets
 
-The bridge pins local routing to Epic's creator-exposed UEFN 42.40 policy: `UEFN-v42.40-CL-59247843`. The manifest contains exactly 29 toolsets and 386 approved tools. Epic's new `ProgrammaticToolset` (`execute_tool_script`) is left out on purpose; the bridge's own `exec` covers scripting. This prevents registered editor-internal toolsets or hidden tools from becoming available through the fast local path.
+The bridge pins local routing to Epic's creator-exposed policy for each supported build: `UEFN-v42.40-CL-59247843` (29 toolsets, 386 tools) and `UEFN-v43.00-CL-59596594` (54 toolsets, 819 tools). A tool runs locally only when a pinned snapshot lists it and the running editor's registry exposes it. Epic's `ProgrammaticToolset` (`execute_tool_script`) and 43.00's `PythonScriptingTools` are left out on purpose; the bridge's own `exec` covers scripting. This prevents registered editor-internal toolsets or hidden tools from becoming available through the fast local path.
 
 | Command | Purpose |
 |---|---|
@@ -332,7 +347,7 @@ Example:
 {
   "command": "toolsets.call",
   "params": {
-    "toolset_name": "ValkyrieToolset.SessionToolset",
+    "toolset_name": "ValkyrieFortniteToolset.SessionToolset",
     "tool_name": "GetSessionStatus",
     "arguments": {},
     "allow_mcp_fallback": true
@@ -341,7 +356,7 @@ Example:
 }
 ```
 
-Set `allow_mcp_fallback` to `false` when you explicitly require local execution. If UEFN adds a tool after the pinned v42 policy, that tool is not executed through the local registry until the policy is reviewed. An exact generic call may still reach the official MCP server as a pre-dispatch capability fallback.
+Set `allow_mcp_fallback` to `false` when you explicitly require local execution. If UEFN adds a tool after the pinned policies, that tool is not executed through the local registry until the policy is reviewed. An exact generic call may still reach the official MCP server as a pre-dispatch capability fallback.
 
 Tool names can collide across toolsets. Always provide the full toolset name and the exact tool name returned by its schema.
 
@@ -435,7 +450,7 @@ bridge/
   server.py            HTTP bridge and hybrid router, runs inside UEFN
   client.py            Local Python client
   routes.py            Direct-command and 42-alias routing metadata
-  uefn_tool_policy.py  Exact UEFN v42 local tool allowlist
+  uefn_tool_policy.py  Exact UEFN 42.40 and 43.00 local tool allowlists
   mcp_client.py        Stdlib-only official UEFN MCP client
   startup.py           Optional UEFN init_unreal.py auto-start helper
   updates.py           Update check and verified install
@@ -471,7 +486,7 @@ RULES.md               LLM context and operating rules
 - Start manually with `bridge/server.py`, or copy `bridge/startup.py` to `<Project>/Content/Python/init_unreal.py` alongside the `bridge/` package for project auto-start.
 - `reload` re-reads `server.py` and its sibling modules (`routes.py`, `uefn_tool_policy.py`, `mcp_client.py`, `updates.py`) from disk, so a changed sibling module no longer needs a UEFN restart.
 - The bridge only connects to loopback MCP endpoints and has no remote-access mode.
-- UEFN 42.40 asks two new questions that block the editor: an "Unreal Editor Security" trust prompt when a project opens, and a toast asking to enable Python Editor Scripting locally. The bridge cannot start until Python is enabled; Epic's MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN` turns it on without the GUI.
+- UEFN 42.40 asks two new questions that block the editor: an "Unreal Editor Security" trust prompt when a project opens, and a toast asking to enable Python Editor Scripting locally. The bridge cannot start until Python is enabled; Epic's MCP tool `ValkyrieToolset.ValkyriePythonToolset.EnablePythonInUEFN` (`EnablePythonForMainProject` on 43.00) turns it on without the GUI.
 
 ## Contributing
 
