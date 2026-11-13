@@ -81,7 +81,7 @@ In UEFN, choose `Tools > Execute Python Script` and select `bridge/server.py`.
 The Output Log should include:
 
 ```text
-[Bridge 12:34:56] Bridge v0.7.0 listening on http://127.0.0.1:9210
+[Bridge 12:34:56] Bridge v0.8.0 listening on http://127.0.0.1:9210
 [Bridge 12:34:56] 92 commands registered
 ```
 
@@ -173,6 +173,16 @@ The bridge serves one editor command at a time; other requests wait their turn. 
 - `editor_tick_age_s` is the time since the editor last ran the bridge's tick. It grows while the editor's game thread is blocked. A large value with `editor_command` set means a bridge command is slow; with `editor_command` empty, something outside the bridge holds the editor, such as a modal dialog.
 - Add `"if_busy": "reject"` to a request to fail fast instead of queueing. A busy bridge answers HTTP 409 with `busy` (the same `activity` object) and starts nothing. Busy includes editor work whose own caller already timed out. The Python client raises `BridgeBusy`.
 - Without `timeout_s`, a request's deadline is 30 seconds, except for tools that routinely take longer: `session.start`, `session.push_changes` and `verse.build` get 600 seconds, `session.stop` and `session.start_game` 180, and `session.stop_game` 120. The same applies to `toolsets.call` and `mcp.call` naming those tools. The Python client waits at least as long.
+- While an `exec` runs, `editor_command` also carries `exec`: `quiet_s` (seconds since its last sign of work), `budget_s` and `editor_calls`.
+
+### Late Results and Jobs
+
+A command that outlives its deadline keeps running in the editor, and its result is kept instead of dropped, so you never have to repeat an import or spawn to learn whether it happened:
+
+- A 504 deadline answer carries `job_id`. A native tool that outlives its caller (a push, start or build still working) answers with `job_id` too.
+- Send `job.result` with `{"job_id": "...", "wait_s": 60}` for its state: `running` (with the current `activity`), `done` (`response` is the full reply the caller would have had), `not_started` (it was still queued and never ran) or `unknown` (the bridge stopped, or a native tool went silent). `wait_s` (up to 60) waits for a running job to end. `job.result` answers at once even while the editor is busy, and without `job_id` it lists the kept jobs.
+- Name a job yourself by adding `"job_id"` (letters, digits, `_ . : -`, up to 64) to any request. Its result is then kept however you stop waiting, which helps a caller that gives up before the bridge's own deadline. The Python client sends it with `track_as=`.
+- Results are kept for an hour after a job ends, at most 50 jobs and 1 MB per result; a bridge reload clears them.
 
 ### Python Client
 
@@ -287,15 +297,18 @@ These direct `verse.*` commands inspect placed generated device objects. They ar
 | `viewport.set_camera` | Move the viewport camera |
 | `materials.create_instance` | Create a material instance with parameters |
 | `status` | Return version, routing configuration, commands, and current activity |
-| `exec` | Run embedded Python and return the variable named `result`. If the code raises, the command fails (`ok: false`) and still returns `result`, `stdout`, `stderr` and `traceback`; changes made before the exception stay |
+| `exec` | Run embedded Python and return the variable named `result`. If the code raises, the command fails (`ok: false`) and still returns `result`, `stdout`, `stderr` and `traceback`; changes made before the exception stay. A quiet budget stops an endless loop (see below) |
 | `batch.exec` | Run direct Python commands in one undo transaction and main-thread tick |
 | `undo`, `redo` | Use the editor transaction history |
 | `log`, `history` | Inspect bridge diagnostics |
+| `job.result` | The kept result of a command that outlived its deadline (Late Results and Jobs above) |
 | `reload`, `shutdown` | Manage the bridge process |
 | `bridge.check_update` | Check now whether a newer bridge is published |
 | `bridge.update` | Install the published bridge files, verified, then reload (Updates below) |
 | `fix_throttle` | Disable background CPU throttling |
 | `store.install` | Install the persistent helper store |
+
+`exec` runs on the editor's game thread, so an endless loop would freeze UEFN. A quiet budget stops it instead: once the script's Python has run `budget_s` seconds (default 120) without a sign of work, the bridge raises `ExecInterrupted` in it and the command fails with `stopped_by_budget`. Signs of work reset the clock: any `unreal` API call returning, any native call of 1 s or more, a `print`, or `keep_alive()` (available to the script). Time inside an editor call or a long native call never counts, and the stop never lands while one runs, so a long import, build or save is never cut short. `ExecInterrupted` is not an `Exception`, so `except Exception` does not swallow it. Changes made before the stop stay. Send `budget_s` up to 86400 for a long pure-Python computation, or `0` to turn the budget off.
 
 `batch.exec` accepts direct Python commands only. Toolset Registry and MCP calls are asynchronous and serialized, so friendly aliases and all `toolsets.*` or `mcp.*` commands are rejected inside a batch.
 

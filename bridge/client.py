@@ -33,6 +33,9 @@ class BridgeError(Exception):
 
     ``envelope`` is the complete failure response when the bridge sent one,
     for example the ``stdout`` and ``stderr`` of an ``exec`` that raised.
+    ``job_id`` is set when the command outlived its deadline: its result is
+    kept by the bridge, so collect it with :meth:`UEFNBridge.job_result`
+    instead of sending the command again.
     """
     def __init__(
         self,
@@ -47,6 +50,8 @@ class BridgeError(Exception):
         self.route = route
         self.outcome_unknown = outcome_unknown
         self.envelope = envelope or {}
+        job_id = self.envelope.get("job_id")
+        self.job_id: Optional[str] = job_id if isinstance(job_id, str) else None
 
 
 class BridgeBusy(BridgeError):
@@ -155,6 +160,7 @@ class UEFNBridge:
         *,
         timeout_s: float = 0,
         if_busy: str = "wait",
+        track_as: str = "",
         **params: Any,
     ) -> dict:
         """Execute a command and return the complete response envelope.
@@ -162,13 +168,17 @@ class UEFNBridge:
         ``if_busy="reject"`` returns at once with :class:`BridgeBusy` instead of
         queueing behind a running command. Without ``timeout_s`` the bridge
         applies its own deadline (longer for session, push and build tools),
-        and the client waits at least that long.
+        and the client waits at least that long. ``track_as`` names the job a
+        late result is kept under if the command outlives its deadline (the
+        bridge picks one otherwise).
         """
         payload: dict = {"command": command, "params": params}
         if timeout_s > 0:
             payload["timeout_s"] = timeout_s
         if if_busy != "wait":
             payload["if_busy"] = if_busy
+        if track_as:
+            payload["job_id"] = track_as
         deadline = timeout_s if timeout_s > 0 else default_deadline_s(command, params, 0)
         response_timeout = max(self.timeout, deadline + 5) if deadline > 0 else 0
         resp = self._post(payload, response_timeout)
@@ -209,12 +219,22 @@ class UEFNBridge:
             )
         return resp
 
-    def run(self, command: str, *, timeout_s: float = 0, if_busy: str = "wait", **params: Any) -> Any:
+    def run(
+        self,
+        command: str,
+        *,
+        timeout_s: float = 0,
+        if_busy: str = "wait",
+        track_as: str = "",
+        **params: Any,
+    ) -> Any:
         """Execute a named bridge command with keyword params.
 
         Returns the 'result' dict on success; raises BridgeError on failure.
         """
-        return self.request(command, timeout_s=timeout_s, if_busy=if_busy, **params).get("result")
+        return self.request(
+            command, timeout_s=timeout_s, if_busy=if_busy, track_as=track_as, **params
+        ).get("result")
 
     @property
     def last_route(self) -> str:
@@ -232,13 +252,25 @@ class UEFNBridge:
             return "mcp"
         return "python"
 
-    def exec(self, code: str, timeout_s: float = 0) -> dict:
+    def exec(self, code: str, timeout_s: float = 0, budget_s: Optional[float] = None) -> dict:
         """Run arbitrary Python code inside UEFN.  Returns {result, stdout, stderr}.
 
         If the code raises, this raises BridgeError; its ``envelope`` still has
-        ``stdout`` and ``stderr``.
+        ``stdout`` and ``stderr``. ``budget_s`` is the quiet budget: the bridge
+        stops a script whose Python runs that long with no editor call, print
+        or ``keep_alive()`` (default 120 s, 0 for no limit).
         """
-        return self.run("exec", code=code, timeout_s=timeout_s)
+        if budget_s is None:
+            return self.run("exec", code=code, timeout_s=timeout_s)
+        return self.run("exec", code=code, timeout_s=timeout_s, budget_s=budget_s)
+
+    def job_result(self, job_id: str, wait_s: float = 0) -> dict:
+        """The kept result of a command that outlived its deadline.
+
+        ``state`` is running, done (``response`` is the reply it would have
+        had), not_started or unknown. ``wait_s`` (up to 60) waits for it to end.
+        """
+        return self.run("job.result", timeout_s=wait_s + 10, job_id=job_id, wait_s=wait_s)
 
     def status(self) -> dict:
         """Check bridge health and list available commands."""

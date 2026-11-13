@@ -92,7 +92,13 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 POLL_SLEEP_S = 0.015           # ~66 Hz polling
 HISTORY_CAP = 500              # max entries in command history
 LOG_CAP = 300                  # max log ring entries
-VERSION = "0.7.0"
+VERSION = "0.8.0"
+EXEC_QUIET_BUDGET_S = 120.0    # exec: Python with no sign of work for this long is stopped
+EXEC_MAX_BUDGET_S = 86400.0
+EXEC_LONG_NATIVE_S = 1.0       # a native call this long counts as work, whatever it is
+EXEC_NATIVE_GRACE_S = 0.05     # a native call this old is waited for, never stopped mid-way
+EXEC_WATCH_INTERVAL_S = 0.25
+EXEC_REFIRE_S = 5.0            # a script that swallows the stop is stopped again after this
 DEFAULT_MCP_URL = os.environ.get(
     "UEFN_MCP_URL", "http://127.0.0.1:8000/mcp"
 )
@@ -112,7 +118,18 @@ _pending_tool_calls: Dict[str, Any] = {}
 # They keep the editor busy until they finish; watched for at most this long.
 _outlived_tool_calls: Dict[str, Any] = {}
 OUTLIVED_WATCH_S = 1800.0
-_abandoned_requests: set[str] = set()
+# Requests whose caller timed out, mapped to the job id their late result is kept under.
+_abandoned_requests: Dict[str, str] = {}
+# Job ids callers gave with their request, by request id, while the request is open.
+_rid_jobs: Dict[str, str] = {}
+# Late results by job id (guarded by _results_lock), so a caller that timed out can
+# collect the outcome instead of sending the command again.
+_jobs: Dict[str, dict] = {}
+JOB_KEEP_S = 3600.0        # how long a finished job's result is kept
+JOB_CAP = 50               # most jobs kept; the oldest finished go first
+JOB_WAIT_MAX_S = 60.0      # longest job.result wait_s
+JOB_MAX_RESULT_BYTES = 1024 * 1024
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 _log_lines: List[str] = []
 _history: List[dict] = []
@@ -335,6 +352,7 @@ class _PendingRegistryCall:
         self.started_mono = time.monotonic()
         self.deadline_mono = 0.0
         self.expired = False
+        self.job_id: Optional[str] = None
 
     def still_running(self) -> bool:
         """Whether the native call is still working (asked after its caller's deadline)."""
@@ -342,6 +360,14 @@ class _PendingRegistryCall:
             return not bool(self.async_result.is_complete)
         except Exception:
             return False
+
+    def outcome_now(self) -> Any:
+        """The call's own result, ignoring its deadline (once it has completed)."""
+        deadline, self.deadline_mono = self.deadline_mono, 0.0
+        try:
+            return self.poll()
+        finally:
+            self.deadline_mono = deadline
 
     def poll(self) -> Optional[Any]:
         """Return a response/fallback when complete, otherwise None."""
@@ -902,8 +928,239 @@ def _cmd_status() -> dict:
     }
 
 
+# ── exec quiet budget ──────────────────────────────────────────────────────
+# exec runs on the editor's game thread, so a script stuck in a Python loop
+# freezes UEFN. The bridge stops a script only when its Python has run for the
+# quiet budget with no sign of work; a long but active script is never stopped.
+
+EXEC_FILENAME = "<exec>"
+
+try:
+    import ctypes as _ctypes
+
+    _set_async_exc_api = _ctypes.pythonapi.PyThreadState_SetAsyncExc
+except Exception:  # pragma: no cover - CPython with ctypes has it
+    _ctypes = None
+    _set_async_exc_api = None
+
+
+class ExecInterrupted(BaseException):
+    """Raised inside an exec script the bridge stops after its quiet budget.
+
+    A BaseException, so a script's ``except Exception`` does not swallow it.
+    """
+
+
+def _set_async_exc(thread_id: int, exc: Optional[type]) -> bool:
+    """Raise ``exc`` in a thread at its next Python instruction (None clears it)."""
+    if _set_async_exc_api is None:
+        return False
+    target = _ctypes.c_ulong(thread_id)
+    found = _set_async_exc_api(target, _ctypes.py_object(exc) if exc else None)
+    if found > 1:
+        _set_async_exc_api(target, None)
+        return False
+    return found == 1
+
+
+def _unreal_bases() -> tuple:
+    names = ("Object", "StructBase", "EnumBase")
+    return tuple(base for base in (getattr(unreal, n, None) for n in names) if isinstance(base, type))
+
+
+_UNREAL_BASES = _unreal_bases()
+
+
+def _is_unreal_callable(fn: Any) -> bool:
+    """Whether a native function a script called belongs to the editor API."""
+    try:
+        if getattr(fn, "__module__", None) == "unreal":
+            return True
+        owner = getattr(fn, "__self__", None)
+        if owner is None:
+            owner = getattr(fn, "__objclass__", None)
+        if owner is None:
+            return False
+        if owner is unreal:
+            return True
+        cls = owner if isinstance(owner, type) else type(owner)
+        if getattr(cls, "__module__", "") == "unreal":
+            return True
+        return bool(_UNREAL_BASES) and issubclass(cls, _UNREAL_BASES)
+    except Exception:
+        return False
+
+
+class _ExecGuard:
+    """Stops an exec script whose Python runs for its budget with no sign of work.
+
+    Signs of work: an editor API call returning, any native call of a second or
+    more, a print, or ``keep_alive()``. A stop is raised only while the script's
+    own Python runs, never inside a native call, so an editor operation finishes.
+    """
+
+    def __init__(self, budget_s: float) -> None:
+        self.budget_s = budget_s
+        self.is_unreal = _is_unreal_callable
+        self.thread_id = threading.get_ident()
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.active = False
+        self.watching = False
+        self.previous_profile: Any = None
+        self.started = self.last_work = time.monotonic()
+        # Each call in progress: (0.0, False) for Python, (start, is editor API) for native.
+        self.stack: List[Tuple[float, bool]] = []
+        self.editor_calls = 0
+        self.stops = 0
+        self.last_stop = 0.0
+        self.raised_at = 0.0
+        self.quiet_at_stop = 0.0
+
+    def work(self) -> None:
+        self.last_work = time.monotonic()
+
+    def quiet_s(self) -> float:
+        return time.monotonic() - self.last_work
+
+    def _profile(self, _frame: Any, event: str, arg: Any) -> None:
+        if event == "call":
+            self.stack.append(_PYTHON_CALL)
+        elif event == "c_call":
+            self.stack.append((time.monotonic(), self.is_unreal(arg)))
+        elif event == "return":
+            if self.stack:
+                self.stack.pop()
+        elif event in ("c_return", "c_exception") and self.stack:
+            started, editor = self.stack.pop()
+            if started:
+                now = time.monotonic()
+                if editor:
+                    self.editor_calls += 1
+                    self.last_work = now
+                elif now - started >= EXEC_LONG_NATIVE_S:
+                    self.last_work = now
+
+    def _script_running(self) -> bool:
+        """The script's own code is running, not a bridge helper or a nested tick."""
+        frame = sys._current_frames().get(self.thread_id)
+        while frame is not None:
+            if frame.f_code in _GUARD_CODES:
+                frame = frame.f_back
+                continue
+            filename = frame.f_code.co_filename
+            if filename == EXEC_FILENAME:
+                return True
+            if filename == _BRIDGE_CODE_FILE:
+                return False
+            frame = frame.f_back
+        return False
+
+    def _watch(self) -> None:
+        while not self.done.wait(EXEC_WATCH_INTERVAL_S):
+            now = time.monotonic()
+            quiet = now - self.last_work
+            if quiet < self.budget_s or (self.stops and now - self.last_stop < EXEC_REFIRE_S):
+                continue
+            try:
+                started, editor = self.stack[-1] if self.stack else _PYTHON_CALL
+            except IndexError:
+                started, editor = _PYTHON_CALL
+            # An editor call is work, and any native call already under way may
+            # be: a stop raised now would land as it returns, so wait for it.
+            if started and (editor or now - started >= EXEC_NATIVE_GRACE_S):
+                continue
+            if not self._script_running():
+                continue
+            with self.lock:
+                if not self.active:
+                    return
+                if _set_async_exc(self.thread_id, ExecInterrupted):
+                    self.stops += 1
+                    self.last_stop = now
+                    self.quiet_at_stop = quiet
+
+    def start(self) -> None:
+        if self.budget_s <= 0 or _set_async_exc_api is None:
+            return
+        self.active = self.watching = True
+        self.previous_profile = sys.getprofile()
+        sys.setprofile(self._profile)
+        threading.Thread(target=self._watch, name="uefn-bridge-exec-budget", daemon=True).start()
+
+    def stopped_here(self) -> None:
+        """The script's thread caught the stop."""
+        self.raised_at = time.monotonic()
+
+    def stop(self) -> None:
+        """End the watch. Safe to call again; absorbs a stop that lands meanwhile."""
+        while self.watching:
+            try:
+                sys.setprofile(self.previous_profile)
+                with self.lock:
+                    self.active = False
+                self.done.set()
+                if self.stops and self.raised_at < self.last_stop:
+                    _take_pending_stop()
+                self.watching = False
+            except ExecInterrupted:
+                self.stopped_here()
+
+
+def _take_pending_stop() -> None:
+    """Let a stop fired but not yet raised arrive, so it lands here, not later.
+
+    Clearing it instead (SetAsyncExc with NULL) leaves CPython 3.11's eval
+    breaker set, and the next profiled call then spins forever.
+    """
+    end = time.monotonic() + 0.5
+    while time.monotonic() < end:
+        for _ in range(1000):
+            pass
+
+
+_PYTHON_CALL = (0.0, False)
+# The guard's own frames, run inside the script's calls: they are not bridge code.
+_GUARD_CODES = frozenset({_ExecGuard._profile.__code__, _is_unreal_callable.__code__})
+
+
+class _WorkIO(io.StringIO):
+    """Captured script output; each write counts as a sign of work."""
+
+    def __init__(self, on_write: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_write = on_write
+
+    def write(self, text: str) -> int:
+        self._on_write()
+        return super().write(text)
+
+
+_exec_guard: Optional[_ExecGuard] = None
+
+
+def _exec_budget(budget_s: Any) -> float:
+    if budget_s is None:
+        return EXEC_QUIET_BUDGET_S
+    if isinstance(budget_s, bool) or not isinstance(budget_s, (int, float)):
+        raise ValueError("'budget_s' must be a number of seconds (0 for no limit)")
+    if budget_s <= 0:
+        return 0.0
+    return max(1.0, min(EXEC_MAX_BUDGET_S, float(budget_s)))
+
+
+def _exec_stopped_message(guard: _ExecGuard) -> str:
+    return (
+        f"exec was stopped: its Python ran {guard.quiet_at_stop:.0f} s with no editor call, "
+        f"print or keep_alive() (quiet budget {guard.budget_s:.0f} s), which looks like an "
+        "endless loop. The editor is free again. Changes it made before the stop are kept. "
+        "If the script is meant to run that long, print progress or call keep_alive() in "
+        "its loop, or send budget_s (seconds, 0 for no limit)."
+    )
+
+
 @command("exec")
-def _cmd_exec(code: str, transaction: str = "") -> dict:
+def _cmd_exec(code: str, transaction: str = "", budget_s: Optional[float] = None) -> dict:
     """Run arbitrary Python inside the editor.  Assign to `result` to return
     a value; use print() for stdout.
 
@@ -915,10 +1172,18 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
     If the code raises, the command fails (``ok: false``) and the response
     still carries ``result``, ``stdout`` and ``stderr``. Changes the code made
     before the exception are not rolled back.
+
+    ``budget_s`` (default 120) is the quiet budget: the script is stopped once
+    its Python has run that long with no editor API call, no native call of a
+    second or more, no print and no ``keep_alive()`` call. Work inside one
+    editor call never counts. 0 turns the budget off.
     """
-    out, err = io.StringIO(), io.StringIO()
+    global _exec_guard
+    guard = _ExecGuard(_exec_budget(budget_s))
+    out, err = _WorkIO(guard.work), _WorkIO(guard.work)
     old_out, old_err = sys.stdout, sys.stderr
-    ns: Dict[str, Any] = {"__builtins__": __builtins__, "unreal": unreal, "result": None}
+    ns: Dict[str, Any] = {"__builtins__": __builtins__, "unreal": unreal, "result": None,
+                          "keep_alive": guard.work}
     # convenience subsystem refs
     for alias, cls_name in [
         ("actors", "EditorActorSubsystem"),
@@ -932,24 +1197,54 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
     ns.update({"clip_get": _clip_get, "clip_set": _clip_set, "export_t3d": _export_t3d_impl, "t3d_parse": _t3d_parse, "find_actor": _find_actor})
     raised: Optional[BaseException] = None
     script_traceback = ""
+    finished = False
+    previous_guard, _exec_guard = _exec_guard, guard
     try:
-        sys.stdout, sys.stderr = out, err
-        if transaction:
-            with unreal.ScopedEditorTransaction(transaction):
-                exec(code, ns)
-        else:
-            exec(code, ns)
-    except Exception as exc:
-        raised = exc
-        script_traceback = traceback.format_exc()
-        err.write(script_traceback)
+        try:
+            compiled = compile(code, EXEC_FILENAME, "exec")
+            sys.stdout, sys.stderr = out, err
+            guard.start()
+            try:
+                if transaction:
+                    with unreal.ScopedEditorTransaction(transaction):
+                        exec(compiled, ns)
+                else:
+                    exec(compiled, ns)
+                finished = True
+            finally:
+                guard.stop()
+        except (Exception, ExecInterrupted) as exc:
+            if isinstance(exc, ExecInterrupted):
+                guard.stopped_here()
+            if not (finished and isinstance(exc, ExecInterrupted)):
+                raised = exc
+                script_traceback = traceback.format_exc()
+                err.write(script_traceback)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+    except ExecInterrupted:
+        # The stop landed after the script, before the watch ended: it already finished.
+        guard.stopped_here()
     finally:
+        guard.stop()
         sys.stdout, sys.stderr = old_out, old_err
+        _exec_guard = previous_guard
     output = {
         "result": to_json_safe(ns.get("result")),
         "stdout": out.getvalue(),
         "stderr": err.getvalue(),
     }
+    if isinstance(raised, ExecInterrupted):
+        raise _CommandFailed(
+            _exec_stopped_message(guard),
+            traceback=script_traceback,
+            stopped_by_budget={
+                "budget_s": guard.budget_s,
+                "quiet_s": round(guard.quiet_at_stop, 1),
+                "editor_calls": guard.editor_calls,
+            },
+            **output,
+        )
     if raised is not None:
         raise _CommandFailed(
             f"exec raised {type(raised).__name__}: {raised}",
@@ -957,6 +1252,113 @@ def _cmd_exec(code: str, transaction: str = "") -> dict:
             **output,
         )
     return output
+
+
+# Every function in this file shares it (it is "<string>" after a reload).
+_BRIDGE_CODE_FILE = _cmd_exec.__code__.co_filename
+
+
+# ── Jobs: results kept for callers that timed out ──────────────────────────
+
+
+def _open_job_locked(rid: str, cmd: str, since: float = 0.0) -> str:
+    """Keep this request's late result under its job id. Hold _results_lock."""
+    job_id = _abandoned_requests.get(rid) or _rid_jobs.get(rid) or rid
+    record = _jobs.get(job_id)
+    if record is None or record["state"] != "running":
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "command": cmd,
+            "state": "running",
+            "since": since or time.monotonic(),
+            "finished": 0.0,
+            "response": None,
+            "queued": False,
+        }
+    _prune_jobs_locked()
+    return job_id
+
+
+def _finish_job_locked(job_id: Optional[str], state: str, response: Any) -> None:
+    record = _jobs.get(job_id or "")
+    if record is None or record["state"] != "running":
+        return
+    try:
+        size = len(json.dumps(response, default=str))
+    except Exception:
+        size = JOB_MAX_RESULT_BYTES + 1
+    if size > JOB_MAX_RESULT_BYTES:
+        kept = response if isinstance(response, dict) else {}
+        response = {
+            "ok": kept.get("ok", False),
+            "route": kept.get("route", ""),
+            "error": str(kept.get("error", ""))[:2000],
+            "result_too_large": size,
+            "note": f"The reply was {size} bytes, more than the {JOB_MAX_RESULT_BYTES} a job keeps.",
+        }
+    record.update(state=state, finished=time.monotonic(), response=response)
+
+
+def _prune_jobs_locked() -> None:
+    now = time.monotonic()
+    for job_id, record in list(_jobs.items()):
+        if record["finished"] and now - record["finished"] > JOB_KEEP_S:
+            del _jobs[job_id]
+    if len(_jobs) > JOB_CAP:
+        # The oldest finished go first; running jobs only when nothing else is left.
+        order = sorted(_jobs.values(), key=lambda r: (r["state"] == "running", r["since"]))
+        for record in order[: len(_jobs) - JOB_CAP]:
+            del _jobs[record["job_id"]]
+
+
+def _job_view(record: dict) -> dict:
+    now = time.monotonic()
+    view = {
+        "job_id": record["job_id"],
+        "command": record["command"],
+        "state": record["state"],
+        "seconds": round((record["finished"] or now) - record["since"], 1),
+    }
+    if record["state"] == "running":
+        if record.get("queued"):
+            view["waiting_for_turn"] = True
+        view["activity"] = _activity_snapshot()
+    else:
+        view["response"] = record["response"]
+    return view
+
+
+@command("job.result")
+def _cmd_job_result(job_id: str = "", wait_s: float = 0) -> dict:
+    """The kept result of a command whose caller timed out (the job id its reply gave).
+
+    state is running, done (``response`` is the reply the caller would have had),
+    not_started (it never ran) or unknown. ``wait_s`` (up to 60) waits for a
+    running job to end. Without ``job_id``, lists the kept jobs. Results are kept
+    for an hour after the job ends; a bridge reload clears them.
+    """
+    if not job_id:
+        with _results_lock:
+            _prune_jobs_locked()
+            records = sorted(_jobs.values(), key=lambda r: r["since"])
+            jobs = [{k: v for k, v in _job_view(r).items() if k != "response"} for r in records]
+        return {"jobs": jobs}
+    if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)):
+        raise ValueError("'wait_s' must be a number of seconds")
+    end = time.monotonic() + max(0.0, min(JOB_WAIT_MAX_S, float(wait_s)))
+    while True:
+        with _results_lock:
+            _prune_jobs_locked()
+            record = _jobs.get(job_id)
+            view = _job_view(record) if record else None
+        if view is None:
+            raise _CommandFailed(
+                f"No job '{job_id}'. Results are kept for {JOB_KEEP_S / 60:.0f} minutes after "
+                "a job ends, and a bridge reload clears them; job.result with no job_id lists them."
+            )
+        if view["state"] != "running" or time.monotonic() >= end:
+            return view
+        time.sleep(0.2)
 
 
 @command("log")
@@ -2002,6 +2404,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "error": "'if_busy' must be 'wait' or 'reject'",
             }).encode())
             return
+        job_id = payload.get("job_id")
+        if job_id is not None and not (isinstance(job_id, str) and _JOB_ID_RE.match(job_id)):
+            self._respond(400, json.dumps({
+                "ok": False,
+                "error": "'job_id' must be 1 to 64 letters, digits or . _ : -",
+            }).encode())
+            return
         # Without an explicit timeout_s, slow native tools (session start, push,
         # Verse build) get a deadline that fits them; everything else gets 30 s.
         request_timeout_s = (
@@ -2012,6 +2421,35 @@ class _Handler(BaseHTTPRequestHandler):
 
         rid = uuid.uuid4().hex
         deadline = time.monotonic() + request_timeout_s
+        if cmd in _UNSERIALIZED_HTTP_COMMANDS:
+            job_id = None  # answered at once: nothing to keep
+        if job_id:
+            # Known from the start, so job.result finds it even while it waits its turn.
+            # A job id still running belongs to that command: sharing it would let this
+            # request close the job with its own outcome and drop the real result.
+            with _results_lock:
+                running = _jobs.get(job_id, {}).get("state") == "running"
+                if not running:
+                    _rid_jobs[rid] = job_id
+                    _jobs[_open_job_locked(rid, cmd)]["queued"] = True
+            if running:
+                self._respond(409, json.dumps({
+                    "ok": False,
+                    "route": _command_route(cmd),
+                    "job_id": job_id,
+                    "error": (
+                        f"'{cmd}' was not started: job '{job_id}' is still running. Send "
+                        "job.result with that job_id for its result, or give this request a new job_id."
+                    ),
+                }).encode())
+                return
+
+        def never_started(response: dict) -> dict:
+            if job_id:
+                with _results_lock:
+                    _rid_jobs.pop(rid, None)
+                    _finish_job_locked(job_id, "not_started", response)
+            return response
 
         # Pure status data can remain responsive while an editor tool is active.
         if cmd in _UNSERIALIZED_HTTP_COMMANDS:
@@ -2030,23 +2468,33 @@ class _Handler(BaseHTTPRequestHandler):
             if not acquired or _editor_work_outstanding():
                 if acquired:
                     _request_serial_lock.release()
-                self._respond(409, json.dumps({
+                self._respond(409, json.dumps(never_started({
                     "ok": False,
                     "route": _command_route(cmd),
                     "busy": _activity_snapshot(),
                     "error": f"'{cmd}' was not started because the bridge is busy",
-                }).encode())
+                })).encode())
                 return
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not _wait_for_turn(remaining):
-                self._respond(200, json.dumps({
+                self._respond(200, json.dumps(never_started({
                     "ok": False,
                     "route": _command_route(cmd),
                     "error": f"'{cmd}' expired before serialized dispatch",
-                }).encode())
+                })).encode())
                 return
         _set_dispatch_turn(cmd)
+        if job_id:
+            # A caller that names its job keeps the result however it stops waiting.
+            with _results_lock:
+                record = _jobs.get(job_id)
+                if record is not None and record["state"] == "running":
+                    record["queued"] = False
+                else:
+                    _rid_jobs[rid] = job_id
+                    _open_job_locked(rid, cmd)
+        status, resp = 500, {"ok": False, "error": f"'{cmd}' failed in the bridge before it answered"}
         try:
             if not self._reserve_dispatch():
                 status, resp = 503, {
@@ -2058,6 +2506,10 @@ class _Handler(BaseHTTPRequestHandler):
                     rid, cmd, params, deadline, request_timeout_s
                 )
         finally:
+            with _results_lock:
+                _rid_jobs.pop(rid, None)
+                if job_id and rid not in _abandoned_requests and rid not in _outlived_tool_calls:
+                    _finish_job_locked(job_id, "done", resp)
             _set_dispatch_turn()
             _request_serial_lock.release()
         try:
@@ -2151,15 +2603,28 @@ class _Handler(BaseHTTPRequestHandler):
                 return 200, resp
             time.sleep(POLL_SLEEP_S)
         with _results_lock:
-            _abandoned_requests.add(rid)
-            _results.pop(rid, None)
+            late = _results.pop(rid, None)
+            if late is None:
+                job_id = _open_job_locked(rid, cmd)
+                _abandoned_requests[rid] = job_id
+        if late is not None and not isinstance(late, _MCPFallback):
+            return 200, late
+        if late is not None:
+            return 200, {
+                "ok": False,
+                "route": "toolset_registry",
+                "error": f"'{late.command or cmd}' exhausted its deadline before MCP fallback dispatch",
+            }
         return 504, {
             "ok": False,
             "route": _command_route(cmd),
             "outcome_unknown": True,
+            "job_id": job_id,
             "error": (
                 f"'{cmd}' timed out ({request_timeout_s}s). The operation may "
-                "still complete if it had already started; it was not retried."
+                "still complete if it had already started; it was not retried. "
+                f"Its result is kept as job '{job_id}': send job.result with that "
+                "job_id (wait_s up to 60) instead of sending the command again."
             ),
         }
 
@@ -2303,6 +2768,14 @@ def _activity_snapshot() -> dict:
                   "seconds": round(now - editor["since"], 1)}
     if turn:
         turn = {"command": turn["command"], "seconds": round(now - turn["since"], 1)}
+    guard = _exec_guard
+    if editor and guard is not None:
+        # How long the running exec has gone without a sign of work, against its budget.
+        editor["exec"] = {
+            "quiet_s": round(guard.quiet_s(), 1),
+            "budget_s": guard.budget_s,
+            "editor_calls": guard.editor_calls,
+        }
     return {
         "editor_command": editor,
         "dispatch_turn": turn,
@@ -2313,6 +2786,7 @@ def _activity_snapshot() -> dict:
 # Commands that are safe on the HTTP worker because they make no unreal calls.
 _HTTP_THREAD_COMMANDS = frozenset({
     "status",
+    "job.result",
     "log",
     "history",
     "bridge.check_update",
@@ -2337,6 +2811,7 @@ _NETWORK_COMMANDS = frozenset({
 })
 _UNSERIALIZED_HTTP_COMMANDS = frozenset({
     "status",
+    "job.result",
     "log",
     "history",
     "bridge.check_update",
@@ -2395,10 +2870,22 @@ def _execute_and_respond(rid: str, cmd: str, params: dict) -> Any:
 
 
 def _publish_result(rid: str, result: Any) -> None:
-    """Publish a response unless its HTTP caller has already timed out."""
+    """Publish a response, or keep it under its job when the caller timed out."""
     with _results_lock:
         if rid in _abandoned_requests:
-            _abandoned_requests.remove(rid)
+            job_id = _abandoned_requests.pop(rid)
+            outlived = _outlived_tool_calls.get(rid)
+            if outlived is not None:
+                # Only the deadline passed; the job ends when the native call does.
+                outlived.job_id = job_id
+            elif isinstance(result, _MCPFallback):
+                _finish_job_locked(job_id, "not_started", {
+                    "ok": False,
+                    "route": "mcp",
+                    "error": f"'{result.command}' was not sent to MCP: its caller had timed out",
+                })
+            else:
+                _finish_job_locked(job_id, "done", result)
             return
         _results[rid] = result
 
@@ -2410,8 +2897,22 @@ def _poll_pending_tool_calls() -> None:
             continue
         del _pending_tool_calls[rid]
         if pending.expired and pending.still_running():
-            # The caller hears that it timed out; the native call goes on.
+            # The caller hears that it timed out; the native call goes on, and
+            # its final result is kept under a job.
             _outlived_tool_calls[rid] = pending
+            with _results_lock:
+                pending.job_id = _open_job_locked(rid, pending.command, pending.started_mono)
+            outcome = dict(outcome, job_id=pending.job_id)
+            outcome["error"] += (
+                f" It is still running; its result is kept as job '{pending.job_id}': "
+                "send job.result with that job_id (wait_s up to 60) instead of sending it again."
+            )
+        elif pending.expired:
+            # It finished as the deadline passed: give its real result.
+            outcome = pending.outcome_now()
+            _record_history(pending.command, pending.started_mono, outcome)
+            _publish_result(rid, outcome)
+            continue
         if isinstance(outcome, _MCPFallback):
             outcome.command = pending.command
             outcome.started_mono = pending.started_mono
@@ -2420,8 +2921,21 @@ def _poll_pending_tool_calls() -> None:
         _publish_result(rid, outcome)
     now = time.monotonic()
     for rid, call in list(_outlived_tool_calls.items()):
-        if not call.still_running() or now - call.started_mono > OUTLIVED_WATCH_S:
+        if not call.still_running():
             del _outlived_tool_calls[rid]
+            final = call.outcome_now() if hasattr(call, "outcome_now") else None
+            with _results_lock:
+                _finish_job_locked(getattr(call, "job_id", None), "done", final)
+        elif now - call.started_mono > OUTLIVED_WATCH_S:
+            del _outlived_tool_calls[rid]
+            with _results_lock:
+                _finish_job_locked(getattr(call, "job_id", None), "unknown", {
+                    "ok": False,
+                    "route": "toolset_registry",
+                    "outcome_unknown": True,
+                    "error": f"'{call.command}' was still running after "
+                             f"{OUTLIVED_WATCH_S / 60:.0f} minutes; the bridge stopped watching it",
+                })
     if not _pending_tool_calls:
         if _outlived_tool_calls:
             oldest = min(_outlived_tool_calls.values(), key=lambda call: call.started_mono)
@@ -2455,6 +2969,15 @@ def _cancel_dispatch_state() -> None:
                 "the operation may still complete and was not retried"
             ),
         }
+    stopped = {
+        "ok": False,
+        "route": "toolset_registry",
+        "outcome_unknown": True,
+        "error": "The bridge stopped while this was still running; it may still complete",
+    }
+    with _results_lock:
+        for call in _outlived_tool_calls.values():
+            _finish_job_locked(getattr(call, "job_id", None), "unknown", stopped)
     _pending_tool_calls.clear()
     _outlived_tool_calls.clear()
     _set_editor_command()
@@ -2463,7 +2986,9 @@ def _cancel_dispatch_state() -> None:
     with _results_lock:
         for rid, response in cancellations.items():
             if rid in _abandoned_requests:
-                _abandoned_requests.remove(rid)
+                job_id = _abandoned_requests.pop(rid)
+                state = "unknown" if response.get("outcome_unknown") else "not_started"
+                _finish_job_locked(job_id, state, response)
             else:
                 _results[rid] = response
 
@@ -2499,7 +3024,11 @@ def _tick(dt: float) -> None:
             break
         with _results_lock:
             if rid in _abandoned_requests:
-                _abandoned_requests.remove(rid)
+                _finish_job_locked(_abandoned_requests.pop(rid), "not_started", {
+                    "ok": False,
+                    "route": _command_route(cmd),
+                    "error": f"'{cmd}' never started: its caller timed out before the editor reached it",
+                })
                 done += 1
                 continue
         if time.monotonic() >= deadline:

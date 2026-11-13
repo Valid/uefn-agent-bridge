@@ -55,6 +55,7 @@ PYTHON_COMMANDS = frozenset({
     "exec",
     "fix_throttle",
     "history",
+    "job.result",
     "level.info",
     "level.save",
     "log",
