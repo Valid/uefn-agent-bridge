@@ -310,6 +310,19 @@ class JobTests(unittest.TestCase):
         self.assertEqual(job["state"], "not_started")
         self.assertNotIn("waiting_for_turn", job)
 
+    def test_a_job_id_still_running_is_refused_and_keeps_the_first_result(self):
+        server._commands["test.slow"] = lambda: time.sleep(1.5) or {"spawned": 1}
+        with _Editor():
+            status, _ = self.post({"command": "test.slow", "timeout_s": 1, "job_id": "dup-1"})
+            self.assertEqual(status, 504)
+            status, again = self.post(
+                {"command": "test.slow", "job_id": "dup-1", "if_busy": "reject"}
+            )
+            self.assertEqual(status, 409)
+            self.assertIn("still running", again["error"])
+            job = server._cmd_job_result("dup-1", wait_s=5)
+        self.assertEqual((job["state"], job["response"]["result"]), ("done", {"spawned": 1}))
+
     def test_a_command_the_editor_never_reached_is_not_started(self):
         with server._results_lock:
             server._abandoned_requests["queued-1"] = server._open_job_locked("queued-1", "actors.list")

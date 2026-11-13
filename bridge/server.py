@@ -2425,9 +2425,24 @@ class _Handler(BaseHTTPRequestHandler):
             job_id = None  # answered at once: nothing to keep
         if job_id:
             # Known from the start, so job.result finds it even while it waits its turn.
+            # A job id still running belongs to that command: sharing it would let this
+            # request close the job with its own outcome and drop the real result.
             with _results_lock:
-                _rid_jobs[rid] = job_id
-                _jobs[_open_job_locked(rid, cmd)]["queued"] = True
+                running = _jobs.get(job_id, {}).get("state") == "running"
+                if not running:
+                    _rid_jobs[rid] = job_id
+                    _jobs[_open_job_locked(rid, cmd)]["queued"] = True
+            if running:
+                self._respond(409, json.dumps({
+                    "ok": False,
+                    "route": _command_route(cmd),
+                    "job_id": job_id,
+                    "error": (
+                        f"'{cmd}' was not started: job '{job_id}' is still running. Send "
+                        "job.result with that job_id for its result, or give this request a new job_id."
+                    ),
+                }).encode())
+                return
 
         def never_started(response: dict) -> dict:
             if job_id:

@@ -4,7 +4,7 @@
     "client.py": "3d89de148e855acf11cf996986e1a1cc8750249a2b48d26c4057aa6939ac9d88",
     "mcp_client.py": "af9c8601114fe0aff5c2b63c9a66f710ffc217a1bfc7372d27a0ed045bc2851a",
     "routes.py": "34f8f8ac19f7c24c53cd498dfeae8bb4fa3e792c10695c7a87a7d254d7b68bf4",
-    "server.py": "f19007ee8534d3431a25f8d14cd7be67f696fa5aeb2c2b4526a040f0041d21b9",
+    "server.py": "b57e5bdcde73fcdeeffa9ad92f191e0d31ee56b5f11948d7a97769eca2a06df2",
     "startup.py": "6702c38060cbadfb146956a1b4eca181fdf66a6199e5d13b2616eacc4dbdf713",
     "uefn_tool_policy.py": "516383dd68879998ca1ed67a7f5771f77cbc2281f498c3fe68a67da7c7513a80",
     "updates.py": "52a0e81e7b8f2ea32ea294009287c50b2e3112c399b732fb43adc984e6ee252d"
