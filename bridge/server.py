@@ -1273,6 +1273,7 @@ def _open_job_locked(rid: str, cmd: str, since: float = 0.0) -> str:
             "since": since or time.monotonic(),
             "finished": 0.0,
             "response": None,
+            "queued": False,
         }
     _prune_jobs_locked()
     return job_id
@@ -1319,6 +1320,8 @@ def _job_view(record: dict) -> dict:
         "seconds": round((record["finished"] or now) - record["since"], 1),
     }
     if record["state"] == "running":
+        if record.get("queued"):
+            view["waiting_for_turn"] = True
         view["activity"] = _activity_snapshot()
     else:
         view["response"] = record["response"]
@@ -2418,6 +2421,20 @@ class _Handler(BaseHTTPRequestHandler):
 
         rid = uuid.uuid4().hex
         deadline = time.monotonic() + request_timeout_s
+        if cmd in _UNSERIALIZED_HTTP_COMMANDS:
+            job_id = None  # answered at once: nothing to keep
+        if job_id:
+            # Known from the start, so job.result finds it even while it waits its turn.
+            with _results_lock:
+                _rid_jobs[rid] = job_id
+                _jobs[_open_job_locked(rid, cmd)]["queued"] = True
+
+        def never_started(response: dict) -> dict:
+            if job_id:
+                with _results_lock:
+                    _rid_jobs.pop(rid, None)
+                    _finish_job_locked(job_id, "not_started", response)
+            return response
 
         # Pure status data can remain responsive while an editor tool is active.
         if cmd in _UNSERIALIZED_HTTP_COMMANDS:
@@ -2436,28 +2453,32 @@ class _Handler(BaseHTTPRequestHandler):
             if not acquired or _editor_work_outstanding():
                 if acquired:
                     _request_serial_lock.release()
-                self._respond(409, json.dumps({
+                self._respond(409, json.dumps(never_started({
                     "ok": False,
                     "route": _command_route(cmd),
                     "busy": _activity_snapshot(),
                     "error": f"'{cmd}' was not started because the bridge is busy",
-                }).encode())
+                })).encode())
                 return
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not _wait_for_turn(remaining):
-                self._respond(200, json.dumps({
+                self._respond(200, json.dumps(never_started({
                     "ok": False,
                     "route": _command_route(cmd),
                     "error": f"'{cmd}' expired before serialized dispatch",
-                }).encode())
+                })).encode())
                 return
         _set_dispatch_turn(cmd)
         if job_id:
             # A caller that names its job keeps the result however it stops waiting.
             with _results_lock:
-                _rid_jobs[rid] = job_id
-                _open_job_locked(rid, cmd)
+                record = _jobs.get(job_id)
+                if record is not None and record["state"] == "running":
+                    record["queued"] = False
+                else:
+                    _rid_jobs[rid] = job_id
+                    _open_job_locked(rid, cmd)
         status, resp = 500, {"ok": False, "error": f"'{cmd}' failed in the bridge before it answered"}
         try:
             if not self._reserve_dispatch():

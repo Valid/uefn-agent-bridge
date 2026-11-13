@@ -281,6 +281,35 @@ class JobTests(unittest.TestCase):
             self.assertIn("activity", job["result"])
             self.post({"command": "job.result", "params": {"job_id": "slow-1", "wait_s": 5}})
 
+    def test_a_named_job_waiting_its_turn_is_known_and_can_expire_unstarted(self):
+        release = threading.Event()
+        server._commands["test.slow"] = lambda: release.wait(5) and {"first": True}
+        replies = {}
+
+        def send(name, payload):
+            replies[name] = self.post(payload)
+
+        with _Editor():
+            first = threading.Thread(target=send, args=("first", {"command": "test.slow", "timeout_s": 5}))
+            first.start()
+            time.sleep(0.3)
+            second = threading.Thread(
+                target=send,
+                args=("second", {"command": "actors.list", "timeout_s": 1, "job_id": "behind-1"}),
+            )
+            second.start()
+            time.sleep(0.3)
+            waiting = server._cmd_job_result("behind-1")
+            self.assertEqual(waiting["state"], "running")
+            self.assertTrue(waiting["waiting_for_turn"])
+            second.join(5)
+            release.set()
+            first.join(5)
+        self.assertIn("expired before serialized dispatch", replies["second"][1]["error"])
+        job = server._cmd_job_result("behind-1")
+        self.assertEqual(job["state"], "not_started")
+        self.assertNotIn("waiting_for_turn", job)
+
     def test_a_command_the_editor_never_reached_is_not_started(self):
         with server._results_lock:
             server._abandoned_requests["queued-1"] = server._open_job_locked("queued-1", "actors.list")
